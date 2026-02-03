@@ -3,6 +3,11 @@ name = "qlm"
 version = "0.1.0"
 edition = "2021"
 description = "SQL shell with LLM-powered UDFs (fold, unfold, map)"
+license = "MIT"
+repository = "https://github.com/doublewordai/qlm"
+readme = "README.md"
+keywords = ["sql", "llm", "datafusion", "cli"]
+categories = ["command-line-utilities", "database"]
 
 [[bin]]
 name = "qlm"
