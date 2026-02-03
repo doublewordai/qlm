@@ -1,0 +1,30 @@
+[package]
+name = "qlm"
+version = "0.1.0"
+edition = "2021"
+description = "SQL shell with LLM-powered UDFs (fold, unfold, map)"
+
+[[bin]]
+name = "qlm"
+path = "src/main.rs"
+
+[lib]
+name = "qlm"
+path = "src/lib.rs"
+
+[dependencies]
+datafusion = "44"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json", "multipart", "stream"] }
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+arrow = "53"
+uuid = { version = "1", features = ["v4"] }
+thiserror = "2"
+clap = { version = "4", features = ["derive", "env"] }
+rustyline = { version = "15", features = ["derive"] }
+dirs = "6"
+indicatif = "0.17"
+console = "0.15"
+async-trait = "0.1.89"
