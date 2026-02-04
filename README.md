@@ -155,56 +155,56 @@ This is useful when raw values are too long—map first to compress, then reduce
 
 ## Semantic Search
 
-Create vector indices from your data and search by meaning:
+Search your data by meaning, not just keywords:
 
 ```sql
--- Search for relevant documents
-SELECT * FROM vector_search('docs_idx', 'how does authentication work', 5);
+SELECT * FROM vector_search(docs, content, id, 'how does authentication work', 5);
+--                          table column  id  query                          limit
 ```
 
-Returns a table with `id`, `text`, and `distance` columns—filter, join, and order like any SQL result.
+Returns a table with `id`, `text`, and `distance` columns. Indices are created lazily on first query.
 
-### Creating an Index
+### Basic Usage
 
-**From the command line:**
-```bash
-qlm -t docs=documents.csv --create-index docs_idx:docs:content:id
+```sql
+-- Search documents (index created automatically on first query)
+SELECT * FROM vector_search(docs, content, id, 'kubernetes deployment', 5);
+
+-- Filter by similarity threshold
+SELECT * FROM vector_search(docs, content, id, 'database schema', 10)
+WHERE distance < 0.5;
+
+-- Join back to source table for additional columns
+SELECT d.title, d.author, v.distance
+FROM vector_search(docs, content, id, 'machine learning', 5) v
+JOIN docs d ON d.id = v.id
+ORDER BY v.distance;
 ```
 
-The format is `name:table:text_column[:id_column]`.
+### Explicit Index Creation
+
+For large tables, create the index upfront to see progress:
+
+```sql
+-- Via SQL (can use with -c flag)
+SELECT * FROM create_vector_index(docs, content, id);
+
+-- Returns: index_name (docs_content), embeddings (count)
+```
 
 **In the REPL:**
 ```
-qlm> .load documents.csv
-qlm> .index docs_idx documents content id
-Created vector index 'docs_idx' with 1000 embeddings.
-```
-
-### Querying
-
-```sql
--- Basic search
-SELECT * FROM vector_search('docs_idx', 'kubernetes deployment', 5);
-
--- Filter by similarity threshold
-SELECT text FROM vector_search('docs_idx', 'database schema', 10)
-WHERE distance < 0.5;
-
--- Join back to source data
-SELECT d.title, d.author, v.distance
-FROM vector_search('docs_idx', 'machine learning', 5) v
-JOIN documents d ON d.id = v.id
-ORDER BY v.distance;
+qlm> .index docs content id
+Created vector index 'docs_content' with 1000 embeddings.
 ```
 
 ### Managing Indices
 
 ```
 qlm> .indices              -- List all vector indices
-qlm> .index new_idx t col  -- Create a new index
 ```
 
-Indices persist to disk (default: `~/.local/share/qlm/vectors/`) and survive restarts.
+Indices persist to disk (default: `~/.local/share/qlm/vectors/`) and survive restarts. Lazy-created indices use the naming convention `{table}_{column}`.
 
 ## Supported File Formats
 
@@ -232,7 +232,7 @@ qlm> SELECT title FROM papers WHERE primary_subject LIKE '%Physics%' LIMIT 5;
 qlm> .tables          -- List loaded tables
 qlm> .schema papers   -- Show table schema
 qlm> .functions       -- List available functions
-qlm> .index idx t col -- Create vector index
+qlm> .index t col id  -- Create vector index
 qlm> .indices         -- List vector indices
 qlm> .help            -- Show all commands
 ```
@@ -253,7 +253,6 @@ qlm> .help            -- Show all commands
 | `--embedding-model` | `DOUBLEWORD_EMBEDDING_MODEL` | `Qwen/Qwen3-Embedding-8B` | Embedding model |
 | `--embedding-dim` | `DOUBLEWORD_EMBEDDING_DIM` | `4096` | Embedding dimensions |
 | `--vector-db` | `QLM_VECTOR_DB` | `~/.local/share/qlm/vectors` | Vector index storage |
-| `--create-index` | — | — | Create index: `name:table:col[:id]` |
 
 ## Best Practices
 
@@ -399,14 +398,16 @@ SELECT llm_fold(content, 'Combine:\n{0}\n---\n{1}', 'Summarize: {0}') FROM docs;
 
 ---
 
-### `vector_search(index, query, limit)`
+### `vector_search(table, text_col, id_col, query, limit)`
 
 Table function for semantic search. Returns rows matching the query by meaning.
 
 **Arguments:**
-- `index` — Name of the vector index (created with `.index` or `--create-index`)
-- `query` — Natural language search query
-- `limit` — Maximum number of results to return
+- `table` — Source table name (identifier, no quotes)
+- `text_col` — Column containing text to search (identifier)
+- `id_col` — Column containing row IDs for joining (identifier)
+- `query` — Natural language search query (string)
+- `limit` — Maximum number of results to return (integer)
 
 **Returns:** Table with columns:
 - `id` — Row ID from the original data
@@ -415,21 +416,50 @@ Table function for semantic search. Returns rows matching the query by meaning.
 
 **Example:**
 ```sql
--- Basic search
-SELECT * FROM vector_search('docs_idx', 'error handling', 5);
+-- Basic search (index created lazily)
+SELECT * FROM vector_search(docs, content, id, 'error handling', 5);
 
 -- Filter and join
 SELECT d.title, v.distance
-FROM vector_search('docs_idx', 'async programming', 10) v
+FROM vector_search(docs, content, id, 'async programming', 10) v
 JOIN docs d ON d.id = v.id
 WHERE v.distance < 0.8
 ORDER BY v.distance;
 ```
 
 **Notes:**
-- Requires an index created beforehand
+- Creates index automatically on first query (named `{table}_{text_col}`)
 - Uses batch API for embeddings
 - Indices persist across sessions
+
+---
+
+### `create_vector_index(table, text_col, id_col)`
+
+Explicitly create a vector index. Use this when you want to see embedding progress for large tables.
+
+**Arguments:**
+- `table` — Source table name (identifier, no quotes)
+- `text_col` — Column containing text to embed (identifier)
+- `id_col` — Column containing row IDs (identifier)
+
+**Returns:** Table with columns:
+- `index_name` — Name of the created index (`{table}_{text_col}`)
+- `embeddings` — Number of embeddings created
+
+**Example:**
+```sql
+-- Create index explicitly (shows progress)
+SELECT * FROM create_vector_index(docs, content, id);
+
+-- Then search
+SELECT * FROM vector_search(docs, content, id, 'my query', 5);
+```
+
+**Notes:**
+- Index name follows the convention `{table}_{text_col}`
+- Overwrites existing index with the same name
+- Shows progress during embedding generation
 
 ## License
 

@@ -4,12 +4,14 @@ use datafusion::catalog::TableFunctionImpl;
 use datafusion::catalog::TableProvider;
 use datafusion::common::{plan_err, Result as DFResult, ScalarValue};
 use datafusion::datasource::MemTable;
+use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::Expr;
 use half::f16;
 use lancedb::connect;
 use lancedb::query::{ExecutableQuery, QueryBase};
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 
 use crate::embedding::EmbeddingClient;
 
@@ -34,16 +36,15 @@ impl LanceManager {
         name: &str,
         batches: Vec<RecordBatch>,
         text_column: &str,
-        id_column: Option<&str>,
+        id_column: &str,
     ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
         if batches.is_empty() {
             return Ok(0);
         }
 
-        // Collect all text values
+        // Collect all text values and IDs
         let mut texts: Vec<String> = Vec::new();
         let mut ids: Vec<u64> = Vec::new();
-        let mut row_id: u64 = 0;
 
         for batch in &batches {
             let text_col_idx = batch
@@ -51,33 +52,26 @@ impl LanceManager {
                 .index_of(text_column)
                 .map_err(|_| format!("Column '{}' not found", text_column))?;
 
+            let id_col_idx = batch
+                .schema()
+                .index_of(id_column)
+                .map_err(|_| format!("Column '{}' not found", id_column))?;
+
             let text_array = batch
                 .column(text_col_idx)
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .ok_or_else(|| format!("Column '{}' is not a string", text_column))?;
 
-            // Get ID column if specified
-            let id_array = if let Some(id_col) = id_column {
-                let id_col_idx = batch.schema().index_of(id_col).ok();
-                id_col_idx.map(|idx| batch.column(idx).clone())
-            } else {
-                None
-            };
+            let id_array = batch.column(id_col_idx);
 
             for i in 0..text_array.len() {
                 if !text_array.is_null(i) {
                     texts.push(text_array.value(i).to_string());
-
-                    // Use provided ID or generate one
-                    let id = if let Some(ref arr) = id_array {
-                        extract_id(arr, i).unwrap_or(row_id)
-                    } else {
-                        row_id
-                    };
-                    ids.push(id);
+                    ids.push(extract_id(id_array, i).ok_or_else(|| {
+                        format!("Could not extract ID from column '{}'", id_column)
+                    })?);
                 }
-                row_id += 1;
             }
         }
 
@@ -114,11 +108,7 @@ impl LanceManager {
 
         let batch = RecordBatch::try_new(
             schema,
-            vec![
-                Arc::new(id_array),
-                Arc::new(text_array),
-                vector_array,
-            ],
+            vec![Arc::new(id_array), Arc::new(text_array), vector_array],
         )?;
 
         // Connect to LanceDB and create table
@@ -134,6 +124,19 @@ impl LanceManager {
             .await?;
 
         Ok(count)
+    }
+
+    /// Check if an index exists
+    pub async fn index_exists(&self, name: &str) -> bool {
+        if let Ok(db) = connect(self.db_path.to_string_lossy().as_ref())
+            .execute()
+            .await
+        {
+            if let Ok(tables) = db.table_names().execute().await {
+                return tables.contains(&name.to_string());
+            }
+        }
+        false
     }
 
     /// Search for similar vectors
@@ -215,47 +218,207 @@ pub struct SearchResult {
     pub distance: f32,
 }
 
-/// Table function for vector search: vector_search(index_name, query, limit)
+/// Shared context for vector operations - holds manager and session reference
+pub struct VectorContext {
+    pub manager: Arc<LanceManager>,
+    pub session: Arc<RwLock<Option<Arc<SessionContext>>>>,
+}
+
+impl VectorContext {
+    pub fn new(manager: Arc<LanceManager>) -> Self {
+        Self {
+            manager,
+            session: Arc::new(RwLock::new(None)),
+        }
+    }
+
+    pub async fn set_session(&self, ctx: Arc<SessionContext>) {
+        let mut session = self.session.write().await;
+        *session = Some(ctx);
+    }
+}
+
+impl std::fmt::Debug for VectorContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VectorContext")
+            .field("manager", &self.manager)
+            .finish()
+    }
+}
+
+/// Table function for vector search: vector_search(table, text_col, id_col, query, limit)
 /// Returns a table with id, text, distance columns
+/// Creates index lazily if it doesn't exist
 #[derive(Debug)]
 pub struct VectorSearchTableFunc {
-    manager: Arc<LanceManager>,
+    ctx: Arc<VectorContext>,
 }
 
 impl VectorSearchTableFunc {
-    pub fn new(manager: Arc<LanceManager>) -> Self {
-        Self { manager }
+    pub fn new(ctx: Arc<VectorContext>) -> Self {
+        Self { ctx }
+    }
+}
+
+/// Table function for creating vector indices: create_vector_index(table, text_col, id_col)
+/// Returns a single row with the count of embeddings created
+#[derive(Debug)]
+pub struct CreateVectorIndexTableFunc {
+    ctx: Arc<VectorContext>,
+}
+
+impl CreateVectorIndexTableFunc {
+    pub fn new(ctx: Arc<VectorContext>) -> Self {
+        Self { ctx }
+    }
+}
+
+impl TableFunctionImpl for CreateVectorIndexTableFunc {
+    fn call(&self, args: &[Expr]) -> DFResult<Arc<dyn TableProvider>> {
+        if args.len() != 3 {
+            return plan_err!(
+                "create_vector_index requires 3 arguments: (table, text_col, id_col)"
+            );
+        }
+
+        // Extract identifiers
+        let table_name = extract_identifier(&args[0], "table")?;
+        let text_col = extract_identifier(&args[1], "text_col")?;
+        let id_col = extract_identifier(&args[2], "id_col")?;
+
+        // Use same naming convention as lazy creation
+        let index_name = format!("{}_{}", table_name, text_col);
+
+        let ctx = self.ctx.clone();
+        let count = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                // Get session to query table
+                let session_guard = ctx.session.read().await;
+                let session = session_guard.as_ref().ok_or_else(|| {
+                    datafusion::error::DataFusionError::Execution(
+                        "Session not initialized".to_string(),
+                    )
+                })?;
+
+                // Query the table
+                let df = session
+                    .sql(&format!(
+                        "SELECT {}, {} FROM {}",
+                        id_col, text_col, table_name
+                    ))
+                    .await?;
+                let batches = df.collect().await?;
+
+                // Create the index
+                eprintln!("Creating vector index '{}'...", index_name);
+                let count = ctx
+                    .manager
+                    .create_index(&index_name, batches, &text_col, &id_col)
+                    .await
+                    .map_err(|e| {
+                        datafusion::error::DataFusionError::Execution(format!("{}", e))
+                    })?;
+                eprintln!("Created index '{}' with {} embeddings.", index_name, count);
+
+                Ok::<_, datafusion::error::DataFusionError>(count)
+            })
+        })?;
+
+        // Return a table with the count
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("index_name", DataType::Utf8, false),
+            Field::new("embeddings", DataType::UInt64, false),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec![index_name.as_str()])),
+                Arc::new(UInt64Array::from(vec![count as u64])),
+            ],
+        )?;
+
+        let table = MemTable::try_new(schema, vec![vec![batch]])?;
+        Ok(Arc::new(table))
+    }
+}
+
+/// Extract identifier name from an Expr (handles Column and Literal)
+fn extract_identifier(expr: &Expr, arg_name: &str) -> DFResult<String> {
+    match expr {
+        Expr::Column(col) => Ok(col.name.clone()),
+        Expr::Literal(ScalarValue::Utf8(Some(s))) => Ok(s.clone()),
+        _ => plan_err!("{} must be an identifier or string", arg_name),
     }
 }
 
 impl TableFunctionImpl for VectorSearchTableFunc {
     fn call(&self, args: &[Expr]) -> DFResult<Arc<dyn TableProvider>> {
-        // Extract index_name (first argument)
-        let index_name = match args.get(0) {
-            Some(Expr::Literal(ScalarValue::Utf8(Some(s)))) => s.clone(),
-            _ => return plan_err!("First argument (index_name) must be a string literal"),
+        if args.len() != 5 {
+            return plan_err!(
+                "vector_search requires 5 arguments: (table, text_col, id_col, query, limit)"
+            );
+        }
+
+        // Extract identifiers for table, text_col, id_col
+        let table_name = extract_identifier(&args[0], "table")?;
+        let text_col = extract_identifier(&args[1], "text_col")?;
+        let id_col = extract_identifier(&args[2], "id_col")?;
+
+        // Extract query string
+        let query = match &args[3] {
+            Expr::Literal(ScalarValue::Utf8(Some(s))) => s.clone(),
+            _ => return plan_err!("query must be a string literal"),
         };
 
-        // Extract query (second argument)
-        let query = match args.get(1) {
-            Some(Expr::Literal(ScalarValue::Utf8(Some(s)))) => s.clone(),
-            _ => return plan_err!("Second argument (query) must be a string literal"),
+        // Extract limit
+        let limit: usize = match &args[4] {
+            Expr::Literal(ScalarValue::Int64(Some(n))) => *n as usize,
+            Expr::Literal(ScalarValue::Int32(Some(n))) => *n as usize,
+            _ => return plan_err!("limit must be an integer"),
         };
 
-        // Extract limit (third argument)
-        let limit: usize = match args.get(2) {
-            Some(Expr::Literal(ScalarValue::Int64(Some(n)))) => *n as usize,
-            Some(Expr::Literal(ScalarValue::Int32(Some(n)))) => *n as usize,
-            _ => return plan_err!("Third argument (limit) must be an integer"),
-        };
+        // Index name convention: table_textcol
+        let index_name = format!("{}_{}", table_name, text_col);
 
-        // Perform search (blocking)
-        let manager = self.manager.clone();
+        let ctx = self.ctx.clone();
         let results = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(async { manager.search(&index_name, &query, limit).await })
-        })
-        .map_err(|e| datafusion::error::DataFusionError::Execution(format!("{}", e)))?;
+            tokio::runtime::Handle::current().block_on(async {
+                // Check if index exists, create if not
+                if !ctx.manager.index_exists(&index_name).await {
+                    // Get session to query table
+                    let session_guard = ctx.session.read().await;
+                    let session = session_guard.as_ref().ok_or_else(|| {
+                        datafusion::error::DataFusionError::Execution(
+                            "Session not initialized".to_string(),
+                        )
+                    })?;
+
+                    // Query the table
+                    let df = session
+                        .sql(&format!("SELECT {}, {} FROM {}", id_col, text_col, table_name))
+                        .await?;
+                    let batches = df.collect().await?;
+
+                    // Create the index
+                    eprintln!("Creating vector index '{}'...", index_name);
+                    let count = ctx
+                        .manager
+                        .create_index(&index_name, batches, &text_col, &id_col)
+                        .await
+                        .map_err(|e| {
+                            datafusion::error::DataFusionError::Execution(format!("{}", e))
+                        })?;
+                    eprintln!("Created index '{}' with {} embeddings.", index_name, count);
+                }
+
+                // Perform search
+                ctx.manager
+                    .search(&index_name, &query, limit)
+                    .await
+                    .map_err(|e| datafusion::error::DataFusionError::Execution(format!("{}", e)))
+            })
+        })?;
 
         // Build schema: id, text, distance
         let schema = Arc::new(Schema::new(vec![
@@ -278,7 +441,6 @@ impl TableFunctionImpl for VectorSearchTableFunc {
             ],
         )?;
 
-        // Return as MemTable
         let table = MemTable::try_new(schema, vec![vec![batch]])?;
         Ok(Arc::new(table))
     }
@@ -306,10 +468,8 @@ fn create_vector_array(
 ) -> Result<ArrayRef, Box<dyn std::error::Error + Send + Sync>> {
     use arrow::array::FixedSizeListBuilder;
 
-    let mut builder = FixedSizeListBuilder::new(
-        arrow::array::Float16Builder::new(),
-        dim as i32,
-    );
+    let mut builder =
+        FixedSizeListBuilder::new(arrow::array::Float16Builder::new(), dim as i32);
 
     for embedding in embeddings {
         let values = builder.values();

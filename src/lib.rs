@@ -7,7 +7,7 @@ pub mod validation;
 
 pub use client::LlmClient;
 pub use embedding::EmbeddingClient;
-pub use lance::{LanceManager, VectorSearchTableFunc};
+pub use lance::{CreateVectorIndexTableFunc, LanceManager, VectorContext, VectorSearchTableFunc};
 pub use udaf::LlmFoldUdaf;
 pub use udf::{LlmUdf, LlmUnfoldUdf};
 pub use validation::{

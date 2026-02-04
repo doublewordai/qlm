@@ -4,7 +4,7 @@ use clap::Parser;
 use datafusion::execution::context::{SessionConfig, SessionContext};
 use datafusion::logical_expr::{AggregateUDF, ScalarUDF};
 use datafusion::prelude::NdJsonReadOptions;
-use qlm::{EmbeddingClient, LanceManager, LlmClient, LlmFoldUdaf, LlmUdf, LlmUnfoldUdf, VectorSearchTableFunc};
+use qlm::{CreateVectorIndexTableFunc, EmbeddingClient, LanceManager, LlmClient, LlmFoldUdaf, LlmUdf, LlmUnfoldUdf, VectorContext, VectorSearchTableFunc};
 use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
 use rustyline::highlight::{CmdKind, Highlighter};
@@ -71,10 +71,6 @@ struct Args {
     /// Vector database path
     #[arg(long, env = "QLM_VECTOR_DB")]
     vector_db: Option<PathBuf>,
-
-    /// Create vector index: name:table:text_col[:id_col]
-    #[arg(long, value_name = "NAME:TABLE:COL")]
-    create_index: Option<String>,
 }
 
 // SQL keywords for completion
@@ -165,6 +161,7 @@ const SQL_KEYWORDS: &[&str] = &[
     "llm_unfold",
     "llm_fold",
     "vector_search",
+    "create_vector_index",
 ];
 
 // Dot commands
@@ -432,39 +429,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&vector_db_path).ok();
 
     let lance_manager = Arc::new(LanceManager::new(vector_db_path, embedding_client));
+    let vector_ctx = Arc::new(VectorContext::new(lance_manager.clone()));
 
-    // vector_search(index, query, limit) - semantic search table function
-    ctx.register_udtf("vector_search", Arc::new(VectorSearchTableFunc::new(lance_manager.clone())));
+    // vector_search(table, text_col, id_col, query, limit) - semantic search table function
+    ctx.register_udtf("vector_search", Arc::new(VectorSearchTableFunc::new(vector_ctx.clone())));
+
+    // create_vector_index(name, table, text_col, id_col) - explicit index creation
+    ctx.register_udtf("create_vector_index", Arc::new(CreateVectorIndexTableFunc::new(vector_ctx.clone())));
 
     // Load any specified tables
     for table_spec in &args.tables {
         load_table(&ctx, table_spec).await?;
     }
 
-    // Create vector index if requested
-    if let Some(ref index_spec) = args.create_index {
-        let parts: Vec<&str> = index_spec.split(':').collect();
-        if parts.len() < 3 {
-            return Err("--create-index format: name:table:text_col[:id_col]".into());
-        }
-        let index_name = parts[0];
-        let table_name = parts[1];
-        let text_column = parts[2];
-        let id_column = parts.get(3).copied();
+    // Wrap context in Arc for sharing
+    let ctx = Arc::new(ctx);
 
-        let df = ctx.sql(&format!("SELECT * FROM {}", table_name)).await?;
-        let batches = df.collect().await?;
-
-        if batches.is_empty() {
-            eprintln!("Table '{}' is empty.", table_name);
-        } else {
-            let count = lance_manager
-                .create_index(index_name, batches, text_column, id_column)
-                .await
-                .map_err(|e| e.to_string())?;
-            eprintln!("Created vector index '{}' with {} embeddings.", index_name, count);
-        }
-    }
+    // Set session on vector context for lazy index creation
+    vector_ctx.set_session(ctx.clone()).await;
 
     // Execute based on mode
     if let Some(sql) = args.command {
@@ -478,7 +460,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     } else {
-        run_repl(Arc::new(ctx), lance_manager).await?;
+        run_repl(ctx, lance_manager).await?;
     }
 
     Ok(())
@@ -702,9 +684,10 @@ fn print_welcome() {
     println!("  llm_fold(col, reduce[, map])        Tree-reduce aggregate (M→1)");
     println!();
     println!("\x1b[1mVector Functions:\x1b[0m");
-    println!("  vector_search(index, query, limit)  Semantic search (returns JSON)");
+    println!("  vector_search(t, col, id, query, n)     Semantic search");
+    println!("  create_vector_index(name, t, col, id)   Create index explicitly");
     println!();
-    println!("  Tip: Use .index to create vector indices, {{0:9\\n}} for batching");
+    println!("  Tip: vector_search creates indices lazily, {{0:9\\n}} for batching");
     println!();
 }
 
@@ -728,7 +711,7 @@ async fn handle_dot_command(
             println!("  .load <path>      Load file as table (CSV, Parquet, JSON)");
             println!("  .load name=<path> Load file with custom table name");
             println!("  .functions        List all available functions");
-            println!("  .index <n> <t> <c> Create vector index from table");
+            println!("  .index <t> <c> <id> Create vector index from table");
             println!("  .indices          List vector indices");
             println!("  .history          Show command history");
             println!("  .clear            Clear the screen");
@@ -823,7 +806,8 @@ async fn handle_dot_command(
             println!("  llm_fold(col, reduce[, map])        Aggregate (M→1)");
             println!();
             println!("\x1b[1mVector Functions:\x1b[0m");
-            println!("  vector_search(index, query, limit)  Semantic search");
+            println!("  vector_search(t, col, id, query, n)     Semantic search");
+            println!("  create_vector_index(name, t, col, id)   Create index");
             println!();
             println!(
                 "Run 'SHOW FUNCTIONS;' to see all {} available functions.",
@@ -856,17 +840,17 @@ async fn handle_dot_command(
             Ok(true)
         }
         ".index" | ".idx" => {
-            // .index <name> <table> <text_column> [id_column]
+            // .index <table> <text_column> <id_column>
             if parts.len() < 4 {
-                println!("Usage: .index <name> <table> <text_column> [id_column]");
+                println!("Usage: .index <table> <text_column> <id_column>");
                 println!("Creates a vector index from a table's text column.");
                 println!();
-                println!("Example: .index docs_idx documents content id");
+                println!("Example: .index documents content id");
             } else {
-                let index_name = parts[1];
-                let table_name = parts[2];
-                let text_column = parts[3];
-                let id_column = parts.get(4).copied();
+                let table_name = parts[1];
+                let text_column = parts[2];
+                let id_column = parts[3];
+                let index_name = format!("{}_{}", table_name, text_column);
 
                 // Query the table
                 let df = ctx.sql(&format!("SELECT * FROM {}", table_name)).await?;
@@ -876,7 +860,7 @@ async fn handle_dot_command(
                     println!("Table '{}' is empty.", table_name);
                 } else {
                     let count = lance_manager
-                        .create_index(index_name, batches, text_column, id_column)
+                        .create_index(&index_name, batches, text_column, id_column)
                         .await
                         .map_err(|e| e.to_string())?;
                     println!(
