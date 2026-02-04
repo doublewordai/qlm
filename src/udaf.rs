@@ -393,3 +393,253 @@ impl Accumulator for LlmAggAccumulator {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::Int32Array;
+    use std::sync::Arc;
+
+    #[test]
+    fn test_get_string_value_from_string_array() {
+        let arr: ArrayRef = Arc::new(StringArray::from(vec!["test", "value"]));
+
+        assert_eq!(get_string_value(&arr, 0), Some("test"));
+        assert_eq!(get_string_value(&arr, 1), Some("value"));
+    }
+
+    #[test]
+    fn test_get_string_value_from_string_view_array() {
+        let arr: ArrayRef = Arc::new(StringViewArray::from(vec!["view1", "view2"]));
+
+        assert_eq!(get_string_value(&arr, 0), Some("view1"));
+        assert_eq!(get_string_value(&arr, 1), Some("view2"));
+    }
+
+    #[test]
+    fn test_get_string_value_null() {
+        let arr: ArrayRef = Arc::new(StringArray::from(vec![Some("a"), None, Some("c")]));
+
+        assert_eq!(get_string_value(&arr, 0), Some("a"));
+        assert_eq!(get_string_value(&arr, 1), None);
+        assert_eq!(get_string_value(&arr, 2), Some("c"));
+    }
+
+    #[test]
+    fn test_get_string_value_invalid_type() {
+        let arr: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
+        assert_eq!(get_string_value(&arr, 0), None);
+    }
+
+    #[test]
+    fn test_get_string_array_len_string_array() {
+        let arr: ArrayRef = Arc::new(StringArray::from(vec!["a", "b", "c"]));
+        assert_eq!(get_string_array_len(&arr), Some(3));
+    }
+
+    #[test]
+    fn test_get_string_array_len_string_view_array() {
+        let arr: ArrayRef = Arc::new(StringViewArray::from(vec!["x", "y"]));
+        assert_eq!(get_string_array_len(&arr), Some(2));
+    }
+
+    #[test]
+    fn test_get_string_array_len_empty() {
+        let arr: ArrayRef = Arc::new(StringArray::from(Vec::<&str>::new()));
+        assert_eq!(get_string_array_len(&arr), Some(0));
+    }
+
+    #[test]
+    fn test_get_string_array_len_invalid_type() {
+        let arr: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
+        assert_eq!(get_string_array_len(&arr), None);
+    }
+
+    #[test]
+    fn test_llm_fold_udaf_name() {
+        let client = crate::client::LlmClient::new("http://test", "key", "model");
+        let udaf = LlmFoldUdaf::new(client);
+        assert_eq!(udaf.name(), "llm_fold");
+    }
+
+    #[test]
+    fn test_llm_fold_udaf_return_type() {
+        let client = crate::client::LlmClient::new("http://test", "key", "model");
+        let udaf = LlmFoldUdaf::new(client);
+        let return_type = udaf.return_type(&[]).unwrap();
+        assert_eq!(return_type, DataType::Utf8);
+    }
+
+    #[test]
+    fn test_llm_fold_udaf_signature_variadic() {
+        let client = crate::client::LlmClient::new("http://test", "key", "model");
+        let udaf = LlmFoldUdaf::new(client);
+        let sig = udaf.signature();
+        assert_eq!(sig.volatility, Volatility::Volatile);
+    }
+
+    #[test]
+    fn test_accumulator_initial_state() {
+        let client = crate::client::LlmClient::new("http://test", "key", "model");
+        let acc = LlmAggAccumulator::new(client, false);
+
+        assert!(acc.reduce_prompt.is_none());
+        assert!(acc.map_prompt.is_none());
+        assert!(acc.values.is_empty());
+        assert!(!acc.has_map);
+    }
+
+    #[test]
+    fn test_accumulator_initial_state_with_map() {
+        let client = crate::client::LlmClient::new("http://test", "key", "model");
+        let acc = LlmAggAccumulator::new(client, true);
+
+        assert!(acc.has_map);
+    }
+
+    #[test]
+    fn test_accumulator_size() {
+        let client = crate::client::LlmClient::new("http://test", "key", "model");
+        let mut acc = LlmAggAccumulator::new(client, false);
+
+        let initial_size = acc.size();
+
+        acc.values.push("test value 1".to_string());
+        acc.values.push("test value 2".to_string());
+        acc.reduce_prompt = Some("reduce: {0} {1}".to_string());
+
+        let final_size = acc.size();
+        assert!(final_size > initial_size);
+    }
+
+    #[test]
+    fn test_accumulator_state_serialization() {
+        let client = crate::client::LlmClient::new("http://test", "key", "model");
+        let mut acc = LlmAggAccumulator::new(client, true);
+
+        acc.reduce_prompt = Some("reduce {0} {1}".to_string());
+        acc.map_prompt = Some("map {0}".to_string());
+        acc.values = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+
+        let state = acc.state().unwrap();
+        assert_eq!(state.len(), 3);
+
+        // Verify reduce_prompt
+        match &state[0] {
+            ScalarValue::Utf8(Some(s)) => assert_eq!(s, "reduce {0} {1}"),
+            _ => panic!("Expected Utf8 for reduce_prompt"),
+        }
+
+        // Verify map_prompt
+        match &state[1] {
+            ScalarValue::Utf8(Some(s)) => assert_eq!(s, "map {0}"),
+            _ => panic!("Expected Utf8 for map_prompt"),
+        }
+
+        // Verify values JSON
+        match &state[2] {
+            ScalarValue::Utf8(Some(json)) => {
+                let values: Vec<String> = serde_json::from_str(json).unwrap();
+                assert_eq!(values, vec!["a", "b", "c"]);
+            }
+            _ => panic!("Expected Utf8 JSON for values"),
+        }
+    }
+
+    #[test]
+    fn test_accumulator_state_with_none_prompts() {
+        let client = crate::client::LlmClient::new("http://test", "key", "model");
+        let mut acc = LlmAggAccumulator::new(client, false);
+
+        acc.values = vec!["value1".to_string()];
+
+        let state = acc.state().unwrap();
+
+        // reduce_prompt should be None
+        assert!(matches!(&state[0], ScalarValue::Utf8(None)));
+
+        // map_prompt should be None
+        assert!(matches!(&state[1], ScalarValue::Utf8(None)));
+    }
+
+    #[test]
+    fn test_accumulator_evaluate_empty_values() {
+        let client = crate::client::LlmClient::new("http://test", "key", "model");
+        let mut acc = LlmAggAccumulator::new(client, false);
+
+        let result = acc.evaluate().unwrap();
+        assert!(matches!(result, ScalarValue::Utf8(None)));
+    }
+
+    #[test]
+    fn test_accumulator_evaluate_missing_reduce_prompt() {
+        let client = crate::client::LlmClient::new("http://test", "key", "model");
+        let mut acc = LlmAggAccumulator::new(client, false);
+        acc.values = vec!["value".to_string()];
+
+        let result = acc.evaluate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("reduce prompt"));
+    }
+
+    #[test]
+    fn test_accumulator_evaluate_invalid_reduce_prompt() {
+        let client = crate::client::LlmClient::new("http://test", "key", "model");
+        let mut acc = LlmAggAccumulator::new(client, false);
+        acc.values = vec!["value".to_string()];
+        acc.reduce_prompt = Some("Only {0}".to_string()); // Missing {1}
+
+        let result = acc.evaluate();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_state_fields() {
+        let client = crate::client::LlmClient::new("http://test", "key", "model");
+        let udaf = LlmFoldUdaf::new(client);
+
+        let fields = udaf
+            .state_fields(StateFieldsArgs {
+                name: "test",
+                input_types: &[],
+                return_type: &DataType::Utf8,
+                ordering_fields: &[],
+                is_distinct: false,
+            })
+            .unwrap();
+
+        assert_eq!(fields.len(), 3);
+        assert_eq!(fields[0].name(), "reduce_prompt");
+        assert_eq!(fields[1].name(), "map_prompt");
+        assert_eq!(fields[2].name(), "values");
+
+        for field in &fields {
+            assert_eq!(field.data_type(), &DataType::Utf8);
+        }
+    }
+
+    #[test]
+    fn test_get_string_value_unicode() {
+        let arr: ArrayRef = Arc::new(StringArray::from(vec!["日本語", "emoji 🎉", "مرحبا"]));
+
+        assert_eq!(get_string_value(&arr, 0), Some("日本語"));
+        assert_eq!(get_string_value(&arr, 1), Some("emoji 🎉"));
+        assert_eq!(get_string_value(&arr, 2), Some("مرحبا"));
+    }
+
+    #[test]
+    fn test_get_string_value_special_chars() {
+        let arr: ArrayRef = Arc::new(StringArray::from(vec![
+            "line1\nline2",
+            "tab\there",
+            "quote\"test",
+        ]));
+
+        assert_eq!(get_string_value(&arr, 0), Some("line1\nline2"));
+        assert_eq!(get_string_value(&arr, 1), Some("tab\there"));
+        assert_eq!(get_string_value(&arr, 2), Some("quote\"test"));
+    }
+
+    // Note: Integration tests for update_batch, merge_batch, and tree_reduce
+    // would require mocking the LLM client, which is better done in integration tests
+}

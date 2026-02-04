@@ -521,4 +521,233 @@ mod tests {
         let (_, k) = validate_reduce_template("Merge all: {0:4\n---\n}").unwrap();
         assert_eq!(k, 5);
     }
+
+    // Additional edge case tests
+
+    #[test]
+    fn test_empty_template() {
+        let result = parse_template("");
+        assert!(result.is_valid());
+        assert!(result.placeholders_found.is_empty());
+        assert_eq!(result.max_placeholder, None);
+    }
+
+    #[test]
+    fn test_template_with_only_text() {
+        let result = parse_template("Just some static text without placeholders");
+        assert!(result.is_valid());
+        assert!(result.placeholders_found.is_empty());
+    }
+
+    #[test]
+    fn test_range_placeholder_empty_separator() {
+        let result = expand_template("{0:2}", &["a", "b", "c"]).unwrap();
+        assert_eq!(result, "abc");
+    }
+
+    #[test]
+    fn test_range_placeholder_tab_separator() {
+        let result = expand_template("{0:1\t}", &["a", "b"]).unwrap();
+        assert_eq!(result, "a\tb");
+    }
+
+    #[test]
+    fn test_range_placeholder_multichar_separator() {
+        let result = expand_template("{0:2 | }", &["x", "y", "z"]).unwrap();
+        assert_eq!(result, "x | y | z");
+    }
+
+    #[test]
+    fn test_consecutive_placeholders() {
+        let result = expand_template("{0}{1}{2}", &["a", "b", "c"]).unwrap();
+        assert_eq!(result, "abc");
+    }
+
+    #[test]
+    fn test_repeated_placeholder() {
+        let result = expand_template("{0} and {0} again", &["hello"]).unwrap();
+        assert_eq!(result, "hello and hello again");
+    }
+
+    #[test]
+    fn test_placeholder_at_boundaries() {
+        let result = expand_template("{0}middle{1}", &["start", "end"]).unwrap();
+        assert_eq!(result, "startmiddleend");
+    }
+
+    #[test]
+    fn test_escaped_braces_with_placeholder() {
+        let result = expand_template("Use {{curly}} with {0}", &["value"]).unwrap();
+        assert_eq!(result, "Use {curly} with value");
+    }
+
+    #[test]
+    fn test_double_escaped_braces() {
+        let result = parse_template("{{{{}}}}");
+        assert!(result.is_valid());
+        assert!(result.placeholders_found.is_empty());
+
+        let expanded = expand_template("{{{{0}}}}", &["x"]).unwrap();
+        assert_eq!(expanded, "{{0}}");
+    }
+
+    #[test]
+    fn test_range_invalid_start_greater_than_end() {
+        let result = parse_template("{5:2}");
+        assert!(!result.is_valid());
+        assert!(result.errors.iter().any(|e| matches!(e, TemplateError::InvalidRange(_, _))));
+    }
+
+    #[test]
+    fn test_range_invalid_non_numeric_start() {
+        let result = parse_template("{abc:2}");
+        assert!(!result.is_valid());
+    }
+
+    #[test]
+    fn test_range_invalid_non_numeric_end() {
+        let result = parse_template("{0:abc}");
+        assert!(!result.is_valid());
+    }
+
+    #[test]
+    fn test_range_missing_end() {
+        let result = parse_template("{0:}");
+        assert!(!result.is_valid());
+    }
+
+    #[test]
+    fn test_empty_placeholder() {
+        let result = parse_template("Hello {}!");
+        assert!(!result.is_valid());
+        assert!(result.errors.iter().any(|e| matches!(e, TemplateError::InvalidPlaceholder(_))));
+    }
+
+    #[test]
+    fn test_non_numeric_placeholder_warning() {
+        let result = parse_template("Hello {name}!");
+        assert!(result.is_valid()); // Valid but with warning
+        assert!(result.has_warnings());
+    }
+
+    #[test]
+    fn test_unmatched_closing_brace_warning() {
+        let result = parse_template("Hello } world");
+        assert!(result.is_valid()); // Valid but with warning
+        assert!(result.has_warnings());
+    }
+
+    #[test]
+    fn test_validate_template_with_gaps() {
+        // Template uses {0} and {2} but not {1}
+        let result = validate_template("Hello {0} and {2}", 3, false);
+        assert!(result.is_ok());
+        let warnings = result.unwrap();
+        assert!(!warnings.is_empty()); // Should warn about unused {1}
+    }
+
+    #[test]
+    fn test_validate_template_strict_mode() {
+        // Strict mode: error on unused argument
+        let result = validate_template("Hello {0}", 2, true);
+        assert!(result.is_err());
+
+        // Non-strict mode: warning only
+        let result = validate_template("Hello {0}", 2, false);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_expand_template_insufficient_values() {
+        let result = expand_template("Hello {0} and {1}", &["only_one"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_expand_template_extra_values() {
+        // Extra values are fine - they just won't be used
+        let result = expand_template("Hello {0}", &["used", "unused"]).unwrap();
+        assert_eq!(result, "Hello used");
+    }
+
+    #[test]
+    fn test_validate_map_template_extra_placeholders() {
+        let result = validate_map_template("Map {0} with {1}");
+        assert!(result.is_ok());
+        let warnings = result.unwrap();
+        assert!(!warnings.is_empty()); // Should warn about {1}
+    }
+
+    #[test]
+    fn test_reduce_template_gap_in_placeholders() {
+        // {0}, {1}, {5} - gap at {2}, {3}, {4}
+        let result = validate_reduce_template("{0} + {1} + {5}");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reduce_template_missing_zero() {
+        let result = validate_reduce_template("{1} + {2}");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reduce_template_missing_one() {
+        let result = validate_reduce_template("{0} + {2}");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_unicode_in_template() {
+        let result = expand_template("Hello {0} 世界 {1}!", &["beautiful", "🌍"]).unwrap();
+        assert_eq!(result, "Hello beautiful 世界 🌍!");
+    }
+
+    #[test]
+    fn test_unicode_separator_in_range() {
+        let result = expand_template("{0:2→}", &["a", "b", "c"]).unwrap();
+        assert_eq!(result, "a→b→c");
+    }
+
+    #[test]
+    fn test_newline_in_placeholder_value() {
+        let result = expand_template("Content: {0}", &["line1\nline2\nline3"]).unwrap();
+        assert_eq!(result, "Content: line1\nline2\nline3");
+    }
+
+    #[test]
+    fn test_large_placeholder_index() {
+        let result = parse_template("{99}");
+        assert!(result.is_valid());
+        assert!(result.placeholders_found.contains(&99));
+        assert_eq!(result.max_placeholder, Some(99));
+    }
+
+    #[test]
+    fn test_validation_result_methods() {
+        let mut result = ValidationResult::default();
+        assert!(result.is_valid());
+        assert!(!result.has_warnings());
+
+        result.warnings.push("test warning".to_string());
+        assert!(result.is_valid());
+        assert!(result.has_warnings());
+
+        result.errors.push(TemplateError::InvalidPlaceholder(0));
+        assert!(!result.is_valid());
+    }
+
+    #[test]
+    fn test_template_error_display() {
+        let err = TemplateError::MissingPlaceholder(2, 3);
+        assert!(err.to_string().contains("2"));
+        assert!(err.to_string().contains("3"));
+
+        let err = TemplateError::UnclosedPlaceholder(5);
+        assert!(err.to_string().contains("5"));
+
+        let err = TemplateError::InvalidRange(10, "test reason".to_string());
+        assert!(err.to_string().contains("10"));
+        assert!(err.to_string().contains("test reason"));
+    }
 }

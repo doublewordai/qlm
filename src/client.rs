@@ -127,6 +127,16 @@ impl LlmClient {
         }
     }
 
+    /// Returns the model name
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    /// Returns the base URL
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
     async fn check_response(resp: reqwest::Response) -> Result<reqwest::Response, LlmError> {
         if resp.status().is_success() {
             Ok(resp)
@@ -808,5 +818,207 @@ impl LlmClient {
         }
 
         Ok(results)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_llm_client_new() {
+        let client = LlmClient::new("http://test.api", "test-key", "test-model");
+        assert_eq!(client.base_url(), "http://test.api");
+        assert_eq!(client.model(), "test-model");
+    }
+
+    #[test]
+    fn test_build_jsonl_from_prompts_empty() {
+        let client = LlmClient::new("http://test", "key", "model");
+        let result = client.build_jsonl_from_prompts(&[]).unwrap();
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_build_jsonl_from_prompts_single() {
+        let client = LlmClient::new("http://test", "key", "test-model");
+        let result = client
+            .build_jsonl_from_prompts(&["Hello".to_string()])
+            .unwrap();
+
+        // Parse and verify the JSONL line
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["custom_id"], "req-0");
+        assert_eq!(parsed["method"], "POST");
+        assert_eq!(parsed["url"], "/v1/chat/completions");
+        assert_eq!(parsed["body"]["model"], "test-model");
+        assert_eq!(parsed["body"]["messages"][0]["role"], "user");
+        assert_eq!(parsed["body"]["messages"][0]["content"], "Hello");
+    }
+
+    #[test]
+    fn test_build_jsonl_from_prompts_multiple() {
+        let client = LlmClient::new("http://test", "key", "model");
+        let prompts = vec!["First".to_string(), "Second".to_string(), "Third".to_string()];
+        let result = client.build_jsonl_from_prompts(&prompts).unwrap();
+
+        let lines: Vec<&str> = result.lines().collect();
+        assert_eq!(lines.len(), 3);
+
+        for (i, line) in lines.iter().enumerate() {
+            let parsed: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(parsed["custom_id"], format!("req-{}", i));
+        }
+    }
+
+    #[test]
+    fn test_build_jsonl_from_prompts_special_characters() {
+        let client = LlmClient::new("http://test", "key", "model");
+        let prompts = vec![
+            "Line1\nLine2".to_string(),
+            "Quote: \"test\"".to_string(),
+            "Backslash: \\path".to_string(),
+            "Unicode: 日本語 🎉".to_string(),
+        ];
+        let result = client.build_jsonl_from_prompts(&prompts).unwrap();
+
+        // Verify all lines are valid JSON
+        for line in result.lines() {
+            assert!(
+                serde_json::from_str::<serde_json::Value>(line).is_ok(),
+                "Failed to parse: {}",
+                line
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_jsonl_content_prompt_pairs() {
+        let client = LlmClient::new("http://test", "key", "test-model");
+        let requests = vec![
+            ("Content 1".to_string(), "Prompt 1".to_string()),
+            ("Content 2".to_string(), "Prompt 2".to_string()),
+        ];
+        let result = client.build_jsonl(&requests).unwrap();
+
+        let lines: Vec<&str> = result.lines().collect();
+        assert_eq!(lines.len(), 2);
+
+        let parsed: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(parsed["custom_id"], "req-0");
+        // The content should be in the format "prompt\n\nContent:\ncontent"
+        let message_content = parsed["body"]["messages"][0]["content"].as_str().unwrap();
+        assert!(message_content.contains("Prompt 1"));
+        assert!(message_content.contains("Content 1"));
+    }
+
+    #[test]
+    fn test_llm_error_display() {
+        let err = LlmError::Api {
+            status: 429,
+            message: "Rate limited".to_string(),
+        };
+        let display = err.to_string();
+        assert!(display.contains("429"));
+        assert!(display.contains("Rate limited"));
+
+        let err = LlmError::BatchFailed("Test failure".to_string());
+        assert!(err.to_string().contains("Test failure"));
+
+        let err = LlmError::BatchExpired;
+        assert!(err.to_string().contains("expired"));
+
+        let err = LlmError::BatchCancelled;
+        assert!(err.to_string().contains("cancelled"));
+
+        let err = LlmError::MissingOutputFile;
+        assert!(err.to_string().contains("output file"));
+
+        let err = LlmError::ResultNotFound("req-5".to_string());
+        assert!(err.to_string().contains("req-5"));
+    }
+
+    #[test]
+    fn test_batch_result_line_parsing_success() {
+        let json = r#"{"custom_id":"req-0","response":{"body":{"choices":[{"message":{"content":"Hello response"}}]}}}"#;
+        let result: BatchResultLine = serde_json::from_str(json).unwrap();
+
+        assert_eq!(result.custom_id, "req-0");
+        assert!(result.response.is_some());
+        assert!(result.error.is_none());
+
+        let response = result.response.unwrap();
+        assert_eq!(response.body.choices[0].message.content, "Hello response");
+    }
+
+    #[test]
+    fn test_batch_result_line_parsing_error() {
+        let json = r#"{"custom_id":"req-0","error":{"message":"Model error occurred"}}"#;
+        let result: BatchResultLine = serde_json::from_str(json).unwrap();
+
+        assert_eq!(result.custom_id, "req-0");
+        assert!(result.response.is_none());
+        assert!(result.error.is_some());
+        assert_eq!(result.error.unwrap().message, "Model error occurred");
+    }
+
+    #[test]
+    fn test_batch_result_line_parsing_empty() {
+        let json = r#"{"custom_id":"req-0"}"#;
+        let result: BatchResultLine = serde_json::from_str(json).unwrap();
+
+        assert_eq!(result.custom_id, "req-0");
+        assert!(result.response.is_none());
+        assert!(result.error.is_none());
+    }
+
+    #[test]
+    fn test_max_batch_size_constant() {
+        // Verify the constant is set correctly
+        assert_eq!(MAX_BATCH_SIZE, 50_000);
+    }
+
+    #[test]
+    fn test_jsonl_format_no_trailing_newline() {
+        let client = LlmClient::new("http://test", "key", "model");
+        let prompts = vec!["A".to_string(), "B".to_string()];
+        let result = client.build_jsonl_from_prompts(&prompts).unwrap();
+
+        // Should not end with newline (JSONL lines are joined with \n)
+        assert!(!result.ends_with('\n'));
+        // But should contain newline between lines
+        assert!(result.contains('\n'));
+    }
+
+    #[test]
+    fn test_custom_id_format() {
+        let client = LlmClient::new("http://test", "key", "model");
+        let prompts: Vec<String> = (0..100).map(|i| format!("Prompt {}", i)).collect();
+        let result = client.build_jsonl_from_prompts(&prompts).unwrap();
+
+        for (i, line) in result.lines().enumerate() {
+            let parsed: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(
+                parsed["custom_id"].as_str().unwrap(),
+                format!("req-{}", i)
+            );
+        }
+    }
+
+    #[test]
+    fn test_message_structure() {
+        let client = LlmClient::new("http://test", "key", "model");
+        let result = client
+            .build_jsonl_from_prompts(&["Test prompt".to_string()])
+            .unwrap();
+
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+
+        // Verify message structure
+        let messages = &parsed["body"]["messages"];
+        assert!(messages.is_array());
+        assert_eq!(messages.as_array().unwrap().len(), 1);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"], "Test prompt");
     }
 }

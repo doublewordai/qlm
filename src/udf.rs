@@ -402,3 +402,156 @@ impl ScalarUDFImpl for LlmUnfoldUdf {
         Ok(ColumnarValue::Array(result_array))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::Int32Array;
+
+    #[test]
+    fn test_string_array_ref_from_string_array() {
+        let arr: ArrayRef = Arc::new(StringArray::from(vec!["hello", "world", "test"]));
+        let ref_opt = StringArrayRef::try_from_array(&arr);
+        assert!(ref_opt.is_some());
+
+        let string_ref = ref_opt.unwrap();
+        assert_eq!(string_ref.value(0), "hello");
+        assert_eq!(string_ref.value(1), "world");
+        assert_eq!(string_ref.value(2), "test");
+    }
+
+    #[test]
+    fn test_string_array_ref_from_string_view_array() {
+        let arr: ArrayRef = Arc::new(StringViewArray::from(vec!["view1", "view2", "view3"]));
+        let ref_opt = StringArrayRef::try_from_array(&arr);
+        assert!(ref_opt.is_some());
+
+        let string_ref = ref_opt.unwrap();
+        assert_eq!(string_ref.value(0), "view1");
+        assert_eq!(string_ref.value(1), "view2");
+        assert_eq!(string_ref.value(2), "view3");
+    }
+
+    #[test]
+    fn test_string_array_ref_null_handling() {
+        let arr: ArrayRef = Arc::new(StringArray::from(vec![Some("a"), None, Some("c")]));
+        let string_ref = StringArrayRef::try_from_array(&arr).unwrap();
+
+        assert!(!string_ref.is_null(0));
+        assert!(string_ref.is_null(1));
+        assert!(!string_ref.is_null(2));
+
+        assert_eq!(string_ref.value(0), "a");
+        assert_eq!(string_ref.value(2), "c");
+    }
+
+    #[test]
+    fn test_string_array_ref_null_handling_string_view() {
+        let arr: ArrayRef = Arc::new(StringViewArray::from(vec![Some("x"), None, Some("z")]));
+        let string_ref = StringArrayRef::try_from_array(&arr).unwrap();
+
+        assert!(!string_ref.is_null(0));
+        assert!(string_ref.is_null(1));
+        assert!(!string_ref.is_null(2));
+    }
+
+    #[test]
+    fn test_string_array_ref_invalid_type() {
+        let arr: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
+        let ref_opt = StringArrayRef::try_from_array(&arr);
+        assert!(ref_opt.is_none());
+    }
+
+    #[test]
+    fn test_string_array_ref_empty_array() {
+        let arr: ArrayRef = Arc::new(StringArray::from(Vec::<&str>::new()));
+        let ref_opt = StringArrayRef::try_from_array(&arr);
+        assert!(ref_opt.is_some());
+    }
+
+    #[test]
+    fn test_string_array_ref_unicode_content() {
+        let arr: ArrayRef = Arc::new(StringArray::from(vec!["日本語", "emoji 🚀", "مرحبا"]));
+        let string_ref = StringArrayRef::try_from_array(&arr).unwrap();
+
+        assert_eq!(string_ref.value(0), "日本語");
+        assert_eq!(string_ref.value(1), "emoji 🚀");
+        assert_eq!(string_ref.value(2), "مرحبا");
+    }
+
+    #[test]
+    fn test_llm_udf_name() {
+        let client = crate::client::LlmClient::new("http://test", "key", "model");
+        let udf = LlmUdf::new(client);
+        assert_eq!(udf.name(), "llm");
+    }
+
+    #[test]
+    fn test_llm_udf_return_type() {
+        let client = crate::client::LlmClient::new("http://test", "key", "model");
+        let udf = LlmUdf::new(client);
+        let return_type = udf.return_type(&[]).unwrap();
+        assert_eq!(return_type, DataType::Utf8);
+    }
+
+    #[test]
+    fn test_llm_udf_signature_variadic() {
+        let client = crate::client::LlmClient::new("http://test", "key", "model");
+        let udf = LlmUdf::new(client);
+        let sig = udf.signature();
+        assert_eq!(sig.volatility, Volatility::Volatile);
+    }
+
+    #[test]
+    fn test_llm_unfold_udf_name() {
+        let client = crate::client::LlmClient::new("http://test", "key", "model");
+        let udf = LlmUnfoldUdf::new(client);
+        assert_eq!(udf.name(), "llm_unfold");
+    }
+
+    #[test]
+    fn test_llm_unfold_udf_return_type() {
+        let client = crate::client::LlmClient::new("http://test", "key", "model");
+        let udf = LlmUnfoldUdf::new(client);
+        let return_type = udf.return_type(&[]).unwrap();
+
+        // Should return List<Utf8>
+        match return_type {
+            DataType::List(field) => {
+                assert_eq!(field.data_type(), &DataType::Utf8);
+            }
+            _ => panic!("Expected List type, got {:?}", return_type),
+        }
+    }
+
+    #[test]
+    fn test_llm_unfold_udf_signature_variadic() {
+        let client = crate::client::LlmClient::new("http://test", "key", "model");
+        let udf = LlmUnfoldUdf::new(client);
+        let sig = udf.signature();
+        assert_eq!(sig.volatility, Volatility::Volatile);
+    }
+
+    #[test]
+    fn test_string_array_ref_special_strings() {
+        let arr: ArrayRef = Arc::new(StringArray::from(vec![
+            "",                    // empty string
+            " ",                   // whitespace
+            "line1\nline2",        // newline
+            "tab\there",           // tab
+            "quote\"here",         // quote
+            "backslash\\here",     // backslash
+        ]));
+        let string_ref = StringArrayRef::try_from_array(&arr).unwrap();
+
+        assert_eq!(string_ref.value(0), "");
+        assert_eq!(string_ref.value(1), " ");
+        assert_eq!(string_ref.value(2), "line1\nline2");
+        assert_eq!(string_ref.value(3), "tab\there");
+        assert_eq!(string_ref.value(4), "quote\"here");
+        assert_eq!(string_ref.value(5), "backslash\\here");
+    }
+
+    // Note: Integration tests for invoke_with_args would require
+    // mocking the LLM client, which is better done in integration tests
+}

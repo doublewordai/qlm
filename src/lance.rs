@@ -511,3 +511,247 @@ fn batches_to_reader(
 }
 
 use futures_util::TryStreamExt;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{Float64Array, Int32Array, Int64Array, UInt32Array};
+
+    #[test]
+    fn test_extract_string_values_utf8() {
+        let arr: ArrayRef = Arc::new(StringArray::from(vec!["hello", "world", "test"]));
+        let result = extract_string_values(&arr).unwrap();
+
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0], Some("hello"));
+        assert_eq!(result[1], Some("world"));
+        assert_eq!(result[2], Some("test"));
+    }
+
+    #[test]
+    fn test_extract_string_values_utf8_with_nulls() {
+        let arr: ArrayRef = Arc::new(StringArray::from(vec![Some("a"), None, Some("c")]));
+        let result = extract_string_values(&arr).unwrap();
+
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0], Some("a"));
+        assert_eq!(result[1], None);
+        assert_eq!(result[2], Some("c"));
+    }
+
+    #[test]
+    fn test_extract_string_values_utf8view() {
+        let arr: ArrayRef = Arc::new(StringViewArray::from(vec!["view1", "view2"]));
+        let result = extract_string_values(&arr).unwrap();
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0], Some("view1"));
+        assert_eq!(result[1], Some("view2"));
+    }
+
+    #[test]
+    fn test_extract_string_values_invalid_type() {
+        let arr: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
+        let result = extract_string_values(&arr);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_extract_string_values_empty_array() {
+        let arr: ArrayRef = Arc::new(StringArray::from(Vec::<&str>::new()));
+        let result = extract_string_values(&arr).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_extract_id_values_string() {
+        let arr: ArrayRef = Arc::new(StringArray::from(vec!["id1", "id2", "id3"]));
+        let result = extract_id_values(&arr).unwrap();
+
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0], Some("id1".to_string()));
+        assert_eq!(result[1], Some("id2".to_string()));
+        assert_eq!(result[2], Some("id3".to_string()));
+    }
+
+    #[test]
+    fn test_extract_id_values_int64() {
+        let arr: ArrayRef = Arc::new(Int64Array::from(vec![100, 200, 300]));
+        let result = extract_id_values(&arr).unwrap();
+
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0], Some("100".to_string()));
+        assert_eq!(result[1], Some("200".to_string()));
+        assert_eq!(result[2], Some("300".to_string()));
+    }
+
+    #[test]
+    fn test_extract_id_values_uint64() {
+        let arr: ArrayRef = Arc::new(UInt64Array::from(vec![1u64, 2u64, 3u64]));
+        let result = extract_id_values(&arr).unwrap();
+
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0], Some("1".to_string()));
+        assert_eq!(result[1], Some("2".to_string()));
+        assert_eq!(result[2], Some("3".to_string()));
+    }
+
+    #[test]
+    fn test_extract_id_values_int32() {
+        let arr: ArrayRef = Arc::new(Int32Array::from(vec![10, 20, 30]));
+        let result = extract_id_values(&arr).unwrap();
+
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0], Some("10".to_string()));
+        assert_eq!(result[1], Some("20".to_string()));
+        assert_eq!(result[2], Some("30".to_string()));
+    }
+
+    #[test]
+    fn test_extract_id_values_uint32() {
+        let arr: ArrayRef = Arc::new(UInt32Array::from(vec![5u32, 10u32, 15u32]));
+        let result = extract_id_values(&arr).unwrap();
+
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0], Some("5".to_string()));
+        assert_eq!(result[1], Some("10".to_string()));
+        assert_eq!(result[2], Some("15".to_string()));
+    }
+
+    #[test]
+    fn test_extract_id_values_float64() {
+        let arr: ArrayRef = Arc::new(Float64Array::from(vec![1.5, 2.5, 3.5]));
+        let result = extract_id_values(&arr).unwrap();
+
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0], Some("1.5".to_string()));
+        assert_eq!(result[1], Some("2.5".to_string()));
+        assert_eq!(result[2], Some("3.5".to_string()));
+    }
+
+    #[test]
+    fn test_extract_id_values_float32() {
+        let arr: ArrayRef = Arc::new(Float32Array::from(vec![1.1f32, 2.2f32]));
+        let result = extract_id_values(&arr).unwrap();
+
+        assert_eq!(result.len(), 2);
+        // Float formatting may vary slightly
+        assert!(result[0].as_ref().unwrap().starts_with("1.1"));
+        assert!(result[1].as_ref().unwrap().starts_with("2.2"));
+    }
+
+    #[test]
+    fn test_extract_id_values_with_nulls() {
+        let arr: ArrayRef = Arc::new(Int64Array::from(vec![Some(1), None, Some(3)]));
+        let result = extract_id_values(&arr).unwrap();
+
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0], Some("1".to_string()));
+        assert_eq!(result[1], None);
+        assert_eq!(result[2], Some("3".to_string()));
+    }
+
+    #[test]
+    fn test_extract_id_values_string_view() {
+        let arr: ArrayRef = Arc::new(StringViewArray::from(vec!["sv-id-1", "sv-id-2"]));
+        let result = extract_id_values(&arr).unwrap();
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0], Some("sv-id-1".to_string()));
+        assert_eq!(result[1], Some("sv-id-2".to_string()));
+    }
+
+    #[test]
+    fn test_create_vector_array_basic() {
+        let embeddings = vec![
+            vec![0.1f32, 0.2f32, 0.3f32],
+            vec![0.4f32, 0.5f32, 0.6f32],
+        ];
+        let result = create_vector_array(&embeddings, 3).unwrap();
+
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn test_create_vector_array_single() {
+        let embeddings = vec![vec![1.0f32, 2.0f32, 3.0f32, 4.0f32]];
+        let result = create_vector_array(&embeddings, 4).unwrap();
+
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn test_create_vector_array_empty() {
+        let embeddings: Vec<Vec<f32>> = vec![];
+        let result = create_vector_array(&embeddings, 3).unwrap();
+
+        assert_eq!(result.len(), 0);
+    }
+
+    #[test]
+    fn test_create_vector_array_high_dimensions() {
+        let dim = 4096;
+        let embeddings = vec![
+            (0..dim).map(|i| i as f32 / dim as f32).collect(),
+            (0..dim).map(|i| (i as f32 + 0.5) / dim as f32).collect(),
+        ];
+        let result = create_vector_array(&embeddings, dim).unwrap();
+
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn test_search_result_struct() {
+        let result = SearchResult {
+            id: "test-id".to_string(),
+            text: "test content".to_string(),
+            distance: 0.123,
+        };
+
+        assert_eq!(result.id, "test-id");
+        assert_eq!(result.text, "test content");
+        assert!((result.distance - 0.123).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_search_result_clone() {
+        let result = SearchResult {
+            id: "id".to_string(),
+            text: "text".to_string(),
+            distance: 0.5,
+        };
+
+        let cloned = result.clone();
+        assert_eq!(cloned.id, result.id);
+        assert_eq!(cloned.text, result.text);
+        assert!((cloned.distance - result.distance).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_extract_identifier_column() {
+        use datafusion::common::Column;
+
+        let expr = Expr::Column(Column::from_name("my_column"));
+        let result = extract_identifier(&expr, "test").unwrap();
+        assert_eq!(result, "my_column");
+    }
+
+    #[test]
+    fn test_extract_identifier_literal_string() {
+        let expr = Expr::Literal(ScalarValue::Utf8(Some("literal_value".to_string())));
+        let result = extract_identifier(&expr, "test").unwrap();
+        assert_eq!(result, "literal_value");
+    }
+
+    #[test]
+    fn test_extract_identifier_invalid_type() {
+        let expr = Expr::Literal(ScalarValue::Int64(Some(42)));
+        let result = extract_identifier(&expr, "test_arg");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("test_arg"));
+    }
+
+    // Note: Integration tests for VectorContext and LanceManager
+    // would require a real EmbeddingClient, which is better done in
+    // integration tests with mocked API responses.
+}

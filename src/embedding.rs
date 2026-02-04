@@ -556,3 +556,185 @@ impl EmbeddingClient {
         Ok((content_str, new_offset, bytes_read, !is_incomplete))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_embedding_client_new() {
+        let client = EmbeddingClient::new("http://test.api", "test-key", "embed-model", 1024);
+        assert_eq!(client.dimensions(), 1024);
+    }
+
+    #[test]
+    fn test_dimensions_getter() {
+        let client = EmbeddingClient::new("http://test", "key", "model", 4096);
+        assert_eq!(client.dimensions(), 4096);
+
+        let client = EmbeddingClient::new("http://test", "key", "model", 768);
+        assert_eq!(client.dimensions(), 768);
+    }
+
+    #[test]
+    fn test_build_jsonl_empty() {
+        let client = EmbeddingClient::new("http://test", "key", "model", 4096);
+        let result = client.build_jsonl(&[]).unwrap();
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_build_jsonl_single_text() {
+        let client = EmbeddingClient::new("http://test", "key", "embed-model", 4096);
+        let texts = vec!["Test text for embedding".to_string()];
+        let result = client.build_jsonl(&texts).unwrap();
+
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["custom_id"], "emb-0");
+        assert_eq!(parsed["method"], "POST");
+        assert_eq!(parsed["url"], "/v1/embeddings");
+        assert_eq!(parsed["body"]["model"], "embed-model");
+        assert_eq!(parsed["body"]["input"], "Test text for embedding");
+    }
+
+    #[test]
+    fn test_build_jsonl_multiple_texts() {
+        let client = EmbeddingClient::new("http://test", "key", "model", 4096);
+        let texts = vec![
+            "First text".to_string(),
+            "Second text".to_string(),
+            "Third text".to_string(),
+        ];
+        let result = client.build_jsonl(&texts).unwrap();
+
+        let lines: Vec<&str> = result.lines().collect();
+        assert_eq!(lines.len(), 3);
+
+        for (i, line) in lines.iter().enumerate() {
+            let parsed: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(parsed["custom_id"], format!("emb-{}", i));
+            assert_eq!(parsed["url"], "/v1/embeddings");
+        }
+    }
+
+    #[test]
+    fn test_build_jsonl_special_characters() {
+        let client = EmbeddingClient::new("http://test", "key", "model", 4096);
+        let texts = vec![
+            "Line1\nLine2\nLine3".to_string(),
+            "Tab\there".to_string(),
+            "Quote: \"hello\"".to_string(),
+            "Unicode: 日本語 emoji 🚀".to_string(),
+            "Backslash: C:\\path\\to\\file".to_string(),
+        ];
+        let result = client.build_jsonl(&texts).unwrap();
+
+        // All lines should be valid JSON
+        for line in result.lines() {
+            let parsed = serde_json::from_str::<serde_json::Value>(line);
+            assert!(parsed.is_ok(), "Failed to parse line: {}", line);
+        }
+    }
+
+    #[test]
+    fn test_build_jsonl_long_text() {
+        let client = EmbeddingClient::new("http://test", "key", "model", 4096);
+        let long_text = "word ".repeat(10000); // Very long text
+        let texts = vec![long_text.clone()];
+        let result = client.build_jsonl(&texts).unwrap();
+
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        // The text should be preserved exactly as input
+        assert_eq!(parsed["body"]["input"].as_str().unwrap(), long_text);
+    }
+
+    #[test]
+    fn test_embedding_error_display() {
+        let err = EmbeddingError::Api {
+            status: 401,
+            message: "Unauthorized".to_string(),
+        };
+        let display = err.to_string();
+        assert!(display.contains("401"));
+        assert!(display.contains("Unauthorized"));
+
+        let err = EmbeddingError::BatchFailed("Embedding batch failed".to_string());
+        assert!(err.to_string().contains("Embedding batch failed"));
+
+        let err = EmbeddingError::BatchExpired;
+        assert!(err.to_string().contains("expired"));
+
+        let err = EmbeddingError::BatchCancelled;
+        assert!(err.to_string().contains("cancelled"));
+
+        let err = EmbeddingError::MissingOutputFile;
+        assert!(err.to_string().contains("output file"));
+
+        let err = EmbeddingError::ResultNotFound("emb-5".to_string());
+        assert!(err.to_string().contains("emb-5"));
+    }
+
+    #[test]
+    fn test_custom_id_format_embedding() {
+        let client = EmbeddingClient::new("http://test", "key", "model", 4096);
+        let texts: Vec<String> = (0..50).map(|i| format!("Text {}", i)).collect();
+        let result = client.build_jsonl(&texts).unwrap();
+
+        for (i, line) in result.lines().enumerate() {
+            let parsed: serde_json::Value = serde_json::from_str(line).unwrap();
+            // Embedding requests use "emb-N" format
+            assert_eq!(
+                parsed["custom_id"].as_str().unwrap(),
+                format!("emb-{}", i)
+            );
+        }
+    }
+
+    #[test]
+    fn test_batch_result_line_parsing_embedding_success() {
+        let json = r#"{"custom_id":"emb-0","response":{"body":{"data":[{"embedding":[0.1,0.2,0.3]}]}}}"#;
+        let result: BatchResultLine = serde_json::from_str(json).unwrap();
+
+        assert_eq!(result.custom_id, "emb-0");
+        assert!(result.response.is_some());
+        assert!(result.error.is_none());
+
+        let response = result.response.unwrap();
+        let embedding = &response.body.data[0].embedding;
+        assert_eq!(embedding.len(), 3);
+        assert!((embedding[0] - 0.1).abs() < f32::EPSILON);
+        assert!((embedding[1] - 0.2).abs() < f32::EPSILON);
+        assert!((embedding[2] - 0.3).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_batch_result_line_parsing_embedding_error() {
+        let json = r#"{"custom_id":"emb-0","error":{"message":"Text too long"}}"#;
+        let result: BatchResultLine = serde_json::from_str(json).unwrap();
+
+        assert_eq!(result.custom_id, "emb-0");
+        assert!(result.response.is_none());
+        assert!(result.error.is_some());
+        assert_eq!(result.error.unwrap().message, "Text too long");
+    }
+
+    #[test]
+    fn test_jsonl_no_trailing_newline() {
+        let client = EmbeddingClient::new("http://test", "key", "model", 4096);
+        let texts = vec!["A".to_string(), "B".to_string()];
+        let result = client.build_jsonl(&texts).unwrap();
+
+        assert!(!result.ends_with('\n'));
+        assert!(result.contains('\n'));
+    }
+
+    #[test]
+    fn test_empty_text_handling() {
+        let client = EmbeddingClient::new("http://test", "key", "model", 4096);
+        let texts = vec!["".to_string()];
+        let result = client.build_jsonl(&texts).unwrap();
+
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["body"]["input"], "");
+    }
+}
