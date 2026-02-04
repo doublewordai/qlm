@@ -8,7 +8,7 @@ FROM papers
 LIMIT 100;
 ```
 
-Built on [DataFusion](https://datafusion.apache.org/) and the [Doubleword Batch API](https://doubleword.ai).
+Built on [DataFusion](https://datafusion.apache.org/), [LanceDB](https://lancedb.com/), and the [Doubleword Batch API](https://doubleword.ai).
 
 ## Installation
 
@@ -153,6 +153,59 @@ FROM long_documents;
 
 This is useful when raw values are too long—map first to compress, then reduce.
 
+## Semantic Search
+
+Create vector indices from your data and search by meaning:
+
+```sql
+-- Search for relevant documents
+SELECT * FROM vector_search('docs_idx', 'how does authentication work', 5);
+```
+
+Returns a table with `id`, `text`, and `distance` columns—filter, join, and order like any SQL result.
+
+### Creating an Index
+
+**From the command line:**
+```bash
+qlm -t docs=documents.csv --create-index docs_idx:docs:content:id
+```
+
+The format is `name:table:text_column[:id_column]`.
+
+**In the REPL:**
+```
+qlm> .load documents.csv
+qlm> .index docs_idx documents content id
+Created vector index 'docs_idx' with 1000 embeddings.
+```
+
+### Querying
+
+```sql
+-- Basic search
+SELECT * FROM vector_search('docs_idx', 'kubernetes deployment', 5);
+
+-- Filter by similarity threshold
+SELECT text FROM vector_search('docs_idx', 'database schema', 10)
+WHERE distance < 0.5;
+
+-- Join back to source data
+SELECT d.title, d.author, v.distance
+FROM vector_search('docs_idx', 'machine learning', 5) v
+JOIN documents d ON d.id = v.id
+ORDER BY v.distance;
+```
+
+### Managing Indices
+
+```
+qlm> .indices              -- List all vector indices
+qlm> .index new_idx t col  -- Create a new index
+```
+
+Indices persist to disk (default: `~/.local/share/qlm/vectors/`) and survive restarts.
+
 ## Supported File Formats
 
 | Format | Extensions | Notes |
@@ -179,6 +232,8 @@ qlm> SELECT title FROM papers WHERE primary_subject LIKE '%Physics%' LIMIT 5;
 qlm> .tables          -- List loaded tables
 qlm> .schema papers   -- Show table schema
 qlm> .functions       -- List available functions
+qlm> .index idx t col -- Create vector index
+qlm> .indices         -- List vector indices
 qlm> .help            -- Show all commands
 ```
 
@@ -194,7 +249,11 @@ qlm> .help            -- Show all commands
 |------|-------------|---------|-------------|
 | `--api-key` | `DOUBLEWORD_API_KEY` | (required) | API key |
 | `--api-url` | `DOUBLEWORD_API_URL` | `https://api.doubleword.ai/v1` | API endpoint |
-| `--model` | `DOUBLEWORD_MODEL` | `Qwen/Qwen3-VL-235B-A22B-Instruct-FP8` | Model to use |
+| `--model` | `DOUBLEWORD_MODEL` | `Qwen/Qwen3-VL-235B-A22B-Instruct-FP8` | LLM model |
+| `--embedding-model` | `DOUBLEWORD_EMBEDDING_MODEL` | `Qwen/Qwen3-Embedding-8B` | Embedding model |
+| `--embedding-dim` | `DOUBLEWORD_EMBEDDING_DIM` | `4096` | Embedding dimensions |
+| `--vector-db` | `QLM_VECTOR_DB` | `~/.local/share/qlm/vectors` | Vector index storage |
+| `--create-index` | — | — | Create index: `name:table:col[:id]` |
 
 ## Best Practices
 
@@ -337,6 +396,40 @@ SELECT llm_fold(content, 'Combine:\n{0}\n---\n{1}', 'Summarize: {0}') FROM docs;
 - `{0:3\n}` — 4-way (indices 0-3)
 
 **Complexity:** O(log_K(N)) LLM calls for N rows
+
+---
+
+### `vector_search(index, query, limit)`
+
+Table function for semantic search. Returns rows matching the query by meaning.
+
+**Arguments:**
+- `index` — Name of the vector index (created with `.index` or `--create-index`)
+- `query` — Natural language search query
+- `limit` — Maximum number of results to return
+
+**Returns:** Table with columns:
+- `id` — Row ID from the original data
+- `text` — The indexed text
+- `distance` — Cosine distance (lower = more similar)
+
+**Example:**
+```sql
+-- Basic search
+SELECT * FROM vector_search('docs_idx', 'error handling', 5);
+
+-- Filter and join
+SELECT d.title, v.distance
+FROM vector_search('docs_idx', 'async programming', 10) v
+JOIN docs d ON d.id = v.id
+WHERE v.distance < 0.8
+ORDER BY v.distance;
+```
+
+**Notes:**
+- Requires an index created beforehand
+- Uses batch API for embeddings
+- Indices persist across sessions
 
 ## License
 
