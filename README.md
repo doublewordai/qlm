@@ -163,12 +163,12 @@ SELECT * FROM vector_search(docs, content, id, 'how does authentication work', 5
 --                          table column  id  query                          limit
 ```
 
-Returns a table with `id`, `text`, and `distance` columns. Indices are created lazily on first query.
+Returns a table with `id`, `text`, and `distance` columns. Indices are created lazily on first query—this can be slow for large tables, so consider using `create_vector_index()` explicitly.
 
 ### Basic Usage
 
 ```sql
--- Search documents (index created automatically on first query)
+-- Search documents (index created on first query - can be slow for large tables)
 SELECT * FROM vector_search(docs, content, id, 'kubernetes deployment', 5);
 
 -- Filter by similarity threshold
