@@ -1,4 +1,4 @@
-use arrow::array::{Array, ArrayRef, Float32Array, RecordBatch, StringArray, UInt64Array};
+use arrow::array::{Array, ArrayRef, Float32Array, RecordBatch, StringArray, StringViewArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use datafusion::catalog::TableFunctionImpl;
 use datafusion::catalog::TableProvider;
@@ -44,7 +44,7 @@ impl LanceManager {
 
         // Collect all text values and IDs
         let mut texts: Vec<String> = Vec::new();
-        let mut ids: Vec<u64> = Vec::new();
+        let mut ids: Vec<String> = Vec::new();
 
         for batch in &batches {
             let text_col_idx = batch
@@ -57,20 +57,21 @@ impl LanceManager {
                 .index_of(id_column)
                 .map_err(|_| format!("Column '{}' not found", id_column))?;
 
-            let text_array = batch
-                .column(text_col_idx)
-                .as_any()
-                .downcast_ref::<StringArray>()
+            let text_col = batch.column(text_col_idx);
+            let id_col = batch.column(id_col_idx);
+
+            // Handle both Utf8 (StringArray) and Utf8View (StringViewArray) for text
+            let text_values: Vec<Option<&str>> = extract_string_values(text_col)
                 .ok_or_else(|| format!("Column '{}' is not a string", text_column))?;
 
-            let id_array = batch.column(id_col_idx);
+            // Handle string or numeric IDs
+            let id_values: Vec<Option<String>> = extract_id_values(id_col)
+                .ok_or_else(|| format!("Column '{}' has unsupported type for ID", id_column))?;
 
-            for i in 0..text_array.len() {
-                if !text_array.is_null(i) {
-                    texts.push(text_array.value(i).to_string());
-                    ids.push(extract_id(id_array, i).ok_or_else(|| {
-                        format!("Could not extract ID from column '{}'", id_column)
-                    })?);
+            for (text_opt, id_opt) in text_values.into_iter().zip(id_values.into_iter()) {
+                if let (Some(text), Some(id)) = (text_opt, id_opt) {
+                    texts.push(text.to_string());
+                    ids.push(id);
                 }
             }
         }
@@ -85,16 +86,16 @@ impl LanceManager {
         let embeddings = self.embedding_client.embed_batch(texts.clone()).await?;
 
         // Build Arrow arrays for LanceDB
-        let id_array = UInt64Array::from(ids);
+        let id_array = StringArray::from(ids);
         let text_array = StringArray::from(texts);
 
         // Convert embeddings to Arrow FixedSizeList
         let dim = self.embedding_client.dimensions();
         let vector_array = create_vector_array(&embeddings, dim)?;
 
-        // Create schema
+        // Create schema (id is string to support both numeric and string IDs)
         let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::UInt64, false),
+            Field::new("id", DataType::Utf8, false),
             Field::new("text", DataType::Utf8, false),
             Field::new(
                 "vector",
@@ -179,7 +180,7 @@ impl LanceManager {
         for batch in batches {
             let id_col = batch
                 .column_by_name("id")
-                .and_then(|c| c.as_any().downcast_ref::<UInt64Array>());
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
             let text_col = batch
                 .column_by_name("text")
                 .and_then(|c| c.as_any().downcast_ref::<StringArray>());
@@ -190,7 +191,7 @@ impl LanceManager {
             if let (Some(ids), Some(texts)) = (id_col, text_col) {
                 for i in 0..batch.num_rows() {
                     search_results.push(SearchResult {
-                        id: ids.value(i),
+                        id: ids.value(i).to_string(),
                         text: texts.value(i).to_string(),
                         distance: dist_col.map(|d| d.value(i)).unwrap_or(0.0),
                     });
@@ -213,7 +214,7 @@ impl LanceManager {
 
 #[derive(Debug, Clone)]
 pub struct SearchResult {
-    pub id: u64,
+    pub id: String,
     pub text: String,
     pub distance: f32,
 }
@@ -281,18 +282,14 @@ impl TableFunctionImpl for CreateVectorIndexTableFunc {
             );
         }
 
-        // Extract identifiers
         let table_name = extract_identifier(&args[0], "table")?;
         let text_col = extract_identifier(&args[1], "text_col")?;
         let id_col = extract_identifier(&args[2], "id_col")?;
-
-        // Use same naming convention as lazy creation
         let index_name = format!("{}_{}", table_name, text_col);
 
         let ctx = self.ctx.clone();
         let count = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
-                // Get session to query table
                 let session_guard = ctx.session.read().await;
                 let session = session_guard.as_ref().ok_or_else(|| {
                     datafusion::error::DataFusionError::Execution(
@@ -300,16 +297,11 @@ impl TableFunctionImpl for CreateVectorIndexTableFunc {
                     )
                 })?;
 
-                // Query the table
                 let df = session
-                    .sql(&format!(
-                        "SELECT {}, {} FROM {}",
-                        id_col, text_col, table_name
-                    ))
+                    .sql(&format!("SELECT {}, {} FROM {}", id_col, text_col, table_name))
                     .await?;
                 let batches = df.collect().await?;
 
-                // Create the index
                 eprintln!("Creating vector index '{}'...", index_name);
                 let count = ctx
                     .manager
@@ -422,20 +414,20 @@ impl TableFunctionImpl for VectorSearchTableFunc {
 
         // Build schema: id, text, distance
         let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::UInt64, false),
+            Field::new("id", DataType::Utf8, false),
             Field::new("text", DataType::Utf8, false),
             Field::new("distance", DataType::Float32, false),
         ]));
 
         // Build arrays from results
-        let ids: Vec<u64> = results.iter().map(|r| r.id).collect();
+        let ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
         let texts: Vec<&str> = results.iter().map(|r| r.text.as_str()).collect();
         let distances: Vec<f32> = results.iter().map(|r| r.distance).collect();
 
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(UInt64Array::from(ids)),
+                Arc::new(StringArray::from(ids)),
                 Arc::new(StringArray::from(texts)),
                 Arc::new(Float32Array::from(distances)),
             ],
@@ -448,18 +440,47 @@ impl TableFunctionImpl for VectorSearchTableFunc {
 
 // Helper functions
 
-fn extract_id(array: &ArrayRef, idx: usize) -> Option<u64> {
-    if let Some(arr) = array.as_any().downcast_ref::<UInt64Array>() {
-        Some(arr.value(idx))
-    } else if let Some(arr) = array.as_any().downcast_ref::<arrow::array::Int64Array>() {
-        Some(arr.value(idx) as u64)
-    } else if let Some(arr) = array.as_any().downcast_ref::<arrow::array::UInt32Array>() {
-        Some(arr.value(idx) as u64)
-    } else if let Some(arr) = array.as_any().downcast_ref::<arrow::array::Int32Array>() {
-        Some(arr.value(idx) as u64)
+/// Extract string values from a column (handles Utf8 and Utf8View)
+fn extract_string_values(array: &ArrayRef) -> Option<Vec<Option<&str>>> {
+    if let Some(arr) = array.as_any().downcast_ref::<StringArray>() {
+        Some((0..arr.len()).map(|i| if arr.is_null(i) { None } else { Some(arr.value(i)) }).collect())
+    } else if let Some(arr) = array.as_any().downcast_ref::<StringViewArray>() {
+        Some((0..arr.len()).map(|i| if arr.is_null(i) { None } else { Some(arr.value(i)) }).collect())
     } else {
         None
     }
+}
+
+/// Extract ID values as strings (handles string and numeric types)
+fn extract_id_values(array: &ArrayRef) -> Option<Vec<Option<String>>> {
+    // Try string types first
+    if let Some(arr) = array.as_any().downcast_ref::<StringArray>() {
+        return Some((0..arr.len()).map(|i| if arr.is_null(i) { None } else { Some(arr.value(i).to_string()) }).collect());
+    }
+    if let Some(arr) = array.as_any().downcast_ref::<StringViewArray>() {
+        return Some((0..arr.len()).map(|i| if arr.is_null(i) { None } else { Some(arr.value(i).to_string()) }).collect());
+    }
+    // Try integer types
+    if let Some(arr) = array.as_any().downcast_ref::<UInt64Array>() {
+        return Some((0..arr.len()).map(|i| if arr.is_null(i) { None } else { Some(arr.value(i).to_string()) }).collect());
+    }
+    if let Some(arr) = array.as_any().downcast_ref::<arrow::array::Int64Array>() {
+        return Some((0..arr.len()).map(|i| if arr.is_null(i) { None } else { Some(arr.value(i).to_string()) }).collect());
+    }
+    if let Some(arr) = array.as_any().downcast_ref::<arrow::array::UInt32Array>() {
+        return Some((0..arr.len()).map(|i| if arr.is_null(i) { None } else { Some(arr.value(i).to_string()) }).collect());
+    }
+    if let Some(arr) = array.as_any().downcast_ref::<arrow::array::Int32Array>() {
+        return Some((0..arr.len()).map(|i| if arr.is_null(i) { None } else { Some(arr.value(i).to_string()) }).collect());
+    }
+    // Try float types (for IDs like "2312.06865" parsed as floats)
+    if let Some(arr) = array.as_any().downcast_ref::<arrow::array::Float64Array>() {
+        return Some((0..arr.len()).map(|i| if arr.is_null(i) { None } else { Some(arr.value(i).to_string()) }).collect());
+    }
+    if let Some(arr) = array.as_any().downcast_ref::<arrow::array::Float32Array>() {
+        return Some((0..arr.len()).map(|i| if arr.is_null(i) { None } else { Some(arr.value(i).to_string()) }).collect());
+    }
+    None
 }
 
 fn create_vector_array(

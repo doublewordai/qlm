@@ -3,6 +3,7 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::error::Error as StdError;
 use std::time::Duration;
 use thiserror::Error;
 
@@ -232,7 +233,18 @@ impl EmbeddingClient {
             .bearer_auth(&self.api_key)
             .multipart(form)
             .send()
-            .await?;
+            .await
+            .map_err(|e| {
+                // Print full error chain for debugging
+                eprintln!("Upload error: {}", e);
+                let err_ref: &dyn StdError = &e;
+                let mut source = err_ref.source();
+                while let Some(s) = source {
+                    eprintln!("  caused by: {}", s);
+                    source = s.source();
+                }
+                EmbeddingError::Http(e)
+            })?;
 
         let resp = Self::check_response(resp).await?;
         let file_resp: FileUploadResponse = resp.json().await?;
