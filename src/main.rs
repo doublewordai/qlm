@@ -71,6 +71,10 @@ struct Args {
     /// Vector database path
     #[arg(long, env = "QLM_VECTOR_DB")]
     vector_db: Option<PathBuf>,
+
+    /// Create vector index: name:table:text_col[:id_col]
+    #[arg(long, value_name = "NAME:TABLE:COL")]
+    create_index: Option<String>,
 }
 
 // SQL keywords for completion
@@ -436,6 +440,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Load any specified tables
     for table_spec in &args.tables {
         load_table(&ctx, table_spec).await?;
+    }
+
+    // Create vector index if requested
+    if let Some(ref index_spec) = args.create_index {
+        let parts: Vec<&str> = index_spec.split(':').collect();
+        if parts.len() < 3 {
+            return Err("--create-index format: name:table:text_col[:id_col]".into());
+        }
+        let index_name = parts[0];
+        let table_name = parts[1];
+        let text_column = parts[2];
+        let id_column = parts.get(3).copied();
+
+        let df = ctx.sql(&format!("SELECT * FROM {}", table_name)).await?;
+        let batches = df.collect().await?;
+
+        if batches.is_empty() {
+            eprintln!("Table '{}' is empty.", table_name);
+        } else {
+            let count = lance_manager
+                .create_index(index_name, batches, text_column, id_column)
+                .await
+                .map_err(|e| e.to_string())?;
+            eprintln!("Created vector index '{}' with {} embeddings.", index_name, count);
+        }
     }
 
     // Execute based on mode
