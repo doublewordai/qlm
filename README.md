@@ -73,16 +73,17 @@ FROM (SELECT title FROM papers LIMIT 100);
 
 The range syntax `{0:9\n}` batches 10 consecutive values, joining them with newlines. The LLM output is split by the delimiter (`\n`) and distributed back—one result per row.
 
-This reduces API calls by 10x with minimal prompt overhead.
+Batching improves classification consistency—the LLM sees the full range of items and can calibrate its judgments rather than drifting when processing items independently. This works best for simple outputs (single word/short phrase per item) where you want uniform treatment across rows.
 
-**When to use each:**
+Note: batching doesn't reduce token usage by much (prompt caching already handles repeated instructions). The benefit is primarily about output quality.
 
-| Scenario | Function | Rows per LLM call |
-|----------|----------|-------------------|
-| Small dataset (<100 rows) | `llm()` | 1 |
-| Large dataset, short text | `llm_unfold()` with `{0:49\n}` | 50 |
-| Large dataset, medium text | `llm_unfold()` with `{0:9\n}` | 10 |
-| Long text (full documents) | `llm()` | 1 |
+**When to batch:**
+
+| Use case | Approach |
+|----------|----------|
+| Need consistent classification across items | Batch with `{0:9\n}` or similar |
+| Items are independent / consistency doesn't matter | Use `llm()` per row |
+| Long text that fills the context window | Use `llm()` per row |
 
 ## Extracting Multiple Values
 
