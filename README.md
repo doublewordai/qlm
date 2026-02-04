@@ -62,14 +62,13 @@ The template uses `{0}`, `{1}`, etc. for column values.
 For large datasets, use `llm_unfold()` with range syntax to batch multiple rows into a single LLM call:
 
 ```sql
--- Process 10 rows per LLM call
-SELECT p.title, classification
-FROM papers p, UNNEST(llm_unfold(
+-- Process 10 rows per LLM call (100 rows = 10 LLM calls)
+SELECT title, UNNEST(llm_unfold(
   'Classify each title as theoretical or applied (one word per line):\n{0:9\n}',
-  p.title,
+  title,
   '\n'
-)) AS t(classification)
-LIMIT 1000;
+)) as classification
+FROM (SELECT title FROM papers LIMIT 100);
 ```
 
 The range syntax `{0:9\n}` batches 10 consecutive values, joining them with newlines. The LLM output is split by the delimiter (`\n`) and distributed back—one result per row.
@@ -91,20 +90,20 @@ Use `llm_unfold()` to extract multiple values from each row (fan-out):
 
 ```sql
 -- Extract keywords from each abstract
-SELECT p.title, keyword
-FROM papers p, UNNEST(llm_unfold(
+SELECT title, UNNEST(llm_unfold(
   'List 5 keywords for this paper, one per line:\n{0}',
-  p.abstract,
+  abstract,
   '\n'
-)) AS t(keyword);
+)) as keyword
+FROM (SELECT title, abstract FROM papers LIMIT 10);
 
 -- Parse structured data
-SELECT id, company
-FROM documents d, UNNEST(llm_unfold(
+SELECT id, UNNEST(llm_unfold(
   'Extract all company names mentioned, one per line:\n{0}',
-  d.content,
+  content,
   '\n'
-)) AS t(company);
+)) as company
+FROM (SELECT id, content FROM documents LIMIT 10);
 ```
 
 The delimiter splits the LLM output into an array. Use `UNNEST` to expand into rows.
@@ -296,14 +295,14 @@ Fan-out or batched transformation. Returns an array of strings per row.
 
 *Fan-out (1 row → N outputs):*
 ```sql
-SELECT p.id, keyword
-FROM papers p, UNNEST(llm_unfold('List keywords:\n{0}', p.abstract, '\n')) AS t(keyword);
+SELECT id, UNNEST(llm_unfold('List keywords:\n{0}', abstract, '\n')) as keyword
+FROM (SELECT id, abstract FROM papers LIMIT 10);
 ```
 
 *Batched (N rows → 1 LLM call → N outputs):*
 ```sql
-SELECT p.id, result
-FROM papers p, UNNEST(llm_unfold('Process each:\n{0:9\n}', p.title, '\n')) AS t(result);
+SELECT id, UNNEST(llm_unfold('Process each:\n{0:9\n}', title, '\n')) as result
+FROM (SELECT id, title FROM papers LIMIT 100);
 ```
 
 **Range syntax:** `{start:end<separator>}`
