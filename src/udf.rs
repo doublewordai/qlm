@@ -374,12 +374,21 @@ impl ScalarUDFImpl for LlmUnfoldUdf {
             };
 
             // Distribute items back to rows in this batch
-            for i in 0..actual_batch_size {
-                // Each row gets its corresponding item (or empty if not enough items)
-                let item = items.get(i).copied().unwrap_or("");
-                list_builder.values().append_value(item);
+            if batch_size == 1 {
+                // Fan-out mode: all items go to this single row
+                for item in &items {
+                    list_builder.values().append_value(*item);
+                }
                 list_builder.append(true);
                 row_idx += 1;
+            } else {
+                // Batching mode: one item per row
+                for i in 0..actual_batch_size {
+                    let item = items.get(i).copied().unwrap_or("");
+                    list_builder.values().append_value(item);
+                    list_builder.append(true);
+                    row_idx += 1;
+                }
             }
         }
 

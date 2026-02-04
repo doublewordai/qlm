@@ -1,15 +1,13 @@
-use arrow::array::{
-    Array, ArrayRef, Float32Array, RecordBatch, StringArray, StringBuilder, UInt64Array,
-};
+use arrow::array::{Array, ArrayRef, Float32Array, RecordBatch, StringArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
-use datafusion::common::Result as DFResult;
-use datafusion::logical_expr::{
-    ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, TypeSignature, Volatility,
-};
+use datafusion::catalog::TableFunctionImpl;
+use datafusion::catalog::TableProvider;
+use datafusion::common::{plan_err, Result as DFResult, ScalarValue};
+use datafusion::datasource::MemTable;
+use datafusion::logical_expr::Expr;
 use half::f16;
 use lancedb::connect;
 use lancedb::query::{ExecutableQuery, QueryBase};
-use std::any::Any;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -217,107 +215,72 @@ pub struct SearchResult {
     pub distance: f32,
 }
 
-/// UDF for vector search: vector_search(index_name, query, limit)
+/// Table function for vector search: vector_search(index_name, query, limit)
 /// Returns a table with id, text, distance columns
 #[derive(Debug)]
-pub struct VectorSearchUdf {
+pub struct VectorSearchTableFunc {
     manager: Arc<LanceManager>,
-    signature: Signature,
 }
 
-impl VectorSearchUdf {
+impl VectorSearchTableFunc {
     pub fn new(manager: Arc<LanceManager>) -> Self {
-        Self {
-            manager,
-            signature: Signature::new(
-                TypeSignature::Exact(vec![DataType::Utf8, DataType::Utf8, DataType::Int64]),
-                Volatility::Volatile,
-            ),
-        }
+        Self { manager }
     }
 }
 
-impl ScalarUDFImpl for VectorSearchUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn name(&self) -> &str {
-        "vector_search"
-    }
-
-    fn signature(&self) -> &Signature {
-        &self.signature
-    }
-
-    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
-        // Returns string (JSON array of results for now)
-        Ok(DataType::Utf8)
-    }
-
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        let args = &args.args;
-        if args.len() != 3 {
-            return Err(datafusion::error::DataFusionError::Execution(
-                "vector_search requires 3 arguments: (index_name, query, limit)".to_string(),
-            ));
-        }
-
-        // Extract arguments
-        let index_name = match &args[0] {
-            ColumnarValue::Scalar(s) => s.to_string().trim_matches('\'').to_string(),
-            _ => {
-                return Err(datafusion::error::DataFusionError::Execution(
-                    "index_name must be a string literal".to_string(),
-                ))
-            }
+impl TableFunctionImpl for VectorSearchTableFunc {
+    fn call(&self, args: &[Expr]) -> DFResult<Arc<dyn TableProvider>> {
+        // Extract index_name (first argument)
+        let index_name = match args.get(0) {
+            Some(Expr::Literal(ScalarValue::Utf8(Some(s)))) => s.clone(),
+            _ => return plan_err!("First argument (index_name) must be a string literal"),
         };
 
-        let query = match &args[1] {
-            ColumnarValue::Scalar(s) => s.to_string().trim_matches('\'').to_string(),
-            _ => {
-                return Err(datafusion::error::DataFusionError::Execution(
-                    "query must be a string literal".to_string(),
-                ))
-            }
+        // Extract query (second argument)
+        let query = match args.get(1) {
+            Some(Expr::Literal(ScalarValue::Utf8(Some(s)))) => s.clone(),
+            _ => return plan_err!("Second argument (query) must be a string literal"),
         };
 
-        let limit: usize = match &args[2] {
-            ColumnarValue::Scalar(s) => s
-                .to_string()
-                .parse()
-                .map_err(|_| datafusion::error::DataFusionError::Execution("Invalid limit".into()))?,
-            _ => {
-                return Err(datafusion::error::DataFusionError::Execution(
-                    "limit must be an integer".to_string(),
-                ))
-            }
+        // Extract limit (third argument)
+        let limit: usize = match args.get(2) {
+            Some(Expr::Literal(ScalarValue::Int64(Some(n)))) => *n as usize,
+            Some(Expr::Literal(ScalarValue::Int32(Some(n)))) => *n as usize,
+            _ => return plan_err!("Third argument (limit) must be an integer"),
         };
 
-        // Perform search
+        // Perform search (blocking)
         let manager = self.manager.clone();
         let results = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current()
                 .block_on(async { manager.search(&index_name, &query, limit).await })
         })
-        .map_err(|e| {
-            datafusion::error::DataFusionError::Execution(format!("Vector search error: {}", e))
-        })?;
+        .map_err(|e| datafusion::error::DataFusionError::Execution(format!("{}", e)))?;
 
-        // Return as JSON string
-        let json = serde_json::to_string(&results.iter().map(|r| {
-            serde_json::json!({
-                "id": r.id,
-                "text": r.text,
-                "distance": r.distance
-            })
-        }).collect::<Vec<_>>()).unwrap_or_default();
+        // Build schema: id, text, distance
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt64, false),
+            Field::new("text", DataType::Utf8, false),
+            Field::new("distance", DataType::Float32, false),
+        ]));
 
-        let mut builder = StringBuilder::new();
-        builder.append_value(&json);
-        let array: ArrayRef = Arc::new(builder.finish());
+        // Build arrays from results
+        let ids: Vec<u64> = results.iter().map(|r| r.id).collect();
+        let texts: Vec<&str> = results.iter().map(|r| r.text.as_str()).collect();
+        let distances: Vec<f32> = results.iter().map(|r| r.distance).collect();
 
-        Ok(ColumnarValue::Array(array))
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(ids)),
+                Arc::new(StringArray::from(texts)),
+                Arc::new(Float32Array::from(distances)),
+            ],
+        )?;
+
+        // Return as MemTable
+        let table = MemTable::try_new(schema, vec![vec![batch]])?;
+        Ok(Arc::new(table))
     }
 }
 

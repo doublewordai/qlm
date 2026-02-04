@@ -4,7 +4,7 @@ use clap::Parser;
 use datafusion::execution::context::{SessionConfig, SessionContext};
 use datafusion::logical_expr::{AggregateUDF, ScalarUDF};
 use datafusion::prelude::NdJsonReadOptions;
-use qlm::{EmbeddingClient, LanceManager, LlmClient, LlmFoldUdaf, LlmUdf, LlmUnfoldUdf, VectorSearchUdf};
+use qlm::{EmbeddingClient, LanceManager, LlmClient, LlmFoldUdaf, LlmUdf, LlmUnfoldUdf, VectorSearchTableFunc};
 use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
 use rustyline::highlight::{CmdKind, Highlighter};
@@ -433,9 +433,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let lance_manager = Arc::new(LanceManager::new(vector_db_path, embedding_client));
 
-    // vector_search(index, query, limit) - semantic search
-    let vector_search_udf = ScalarUDF::from(VectorSearchUdf::new(lance_manager.clone()));
-    ctx.register_udf(vector_search_udf);
+    // vector_search(index, query, limit) - semantic search table function
+    ctx.register_udtf("vector_search", Arc::new(VectorSearchTableFunc::new(lance_manager.clone())));
 
     // Load any specified tables
     for table_spec in &args.tables {
