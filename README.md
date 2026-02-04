@@ -59,10 +59,10 @@ The template uses `{0}`, `{1}`, etc. for column values.
 
 ### Batched transformation (N rows = 1 LLM call)
 
-For large datasets, use `llm_unfold()` with range syntax to batch multiple rows into a single LLM call:
+For consistent classification across rows, use `llm_unfold()` with range syntax to batch multiple rows into a single LLM call:
 
 ```sql
--- Process 10 rows per LLM call (100 rows = 10 LLM calls)
+-- Batch 10 rows per LLM call for consistent classification
 SELECT title, UNNEST(llm_unfold(
   'Classify each title as theoretical or applied (one word per line):\n{0:9\n}',
   title,
