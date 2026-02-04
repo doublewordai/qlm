@@ -4,7 +4,7 @@ use clap::Parser;
 use datafusion::execution::context::{SessionConfig, SessionContext};
 use datafusion::logical_expr::{AggregateUDF, ScalarUDF};
 use datafusion::prelude::NdJsonReadOptions;
-use qlm::{LlmClient, LlmFoldUdaf, LlmUdf, LlmUnfoldUdf};
+use qlm::{EmbeddingClient, LanceManager, LlmClient, LlmFoldUdaf, LlmUdf, LlmUnfoldUdf, VectorSearchUdf};
 use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
 use rustyline::highlight::{CmdKind, Highlighter};
@@ -55,6 +55,22 @@ struct Args {
         default_value = "Qwen/Qwen3-VL-235B-A22B-Instruct-FP8"
     )]
     model: String,
+
+    /// Embedding model to use
+    #[arg(
+        long,
+        env = "DOUBLEWORD_EMBEDDING_MODEL",
+        default_value = "Qwen/Qwen3-Embedding-8B"
+    )]
+    embedding_model: String,
+
+    /// Embedding dimensions
+    #[arg(long, env = "DOUBLEWORD_EMBEDDING_DIM", default_value = "4096")]
+    embedding_dim: usize,
+
+    /// Vector database path
+    #[arg(long, env = "QLM_VECTOR_DB")]
+    vector_db: Option<PathBuf>,
 }
 
 // SQL keywords for completion
@@ -144,6 +160,7 @@ const SQL_KEYWORDS: &[&str] = &[
     "llm",
     "llm_unfold",
     "llm_fold",
+    "vector_search",
 ];
 
 // Dot commands
@@ -157,6 +174,8 @@ const DOT_COMMANDS: &[&str] = &[
     ".functions",
     ".clear",
     ".history",
+    ".index",
+    ".indices",
 ];
 
 struct SqlHelper {
@@ -391,6 +410,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let llm_fold = AggregateUDF::from(LlmFoldUdaf::new(client));
     ctx.register_udaf(llm_fold);
 
+    // Set up embedding client and LanceDB
+    let embedding_client = EmbeddingClient::new(
+        &args.api_url,
+        &args.api_key,
+        &args.embedding_model,
+        args.embedding_dim,
+    );
+
+    let vector_db_path = args.vector_db.unwrap_or_else(|| {
+        dirs::data_local_dir()
+            .map(|p| p.join("qlm").join("vectors"))
+            .unwrap_or_else(|| PathBuf::from(".qlm/vectors"))
+    });
+
+    // Create vector DB directory if needed
+    std::fs::create_dir_all(&vector_db_path).ok();
+
+    let lance_manager = Arc::new(LanceManager::new(vector_db_path, embedding_client));
+
+    // vector_search(index, query, limit) - semantic search
+    let vector_search_udf = ScalarUDF::from(VectorSearchUdf::new(lance_manager.clone()));
+    ctx.register_udf(vector_search_udf);
+
     // Load any specified tables
     for table_spec in &args.tables {
         load_table(&ctx, table_spec).await?;
@@ -408,7 +450,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     } else {
-        run_repl(Arc::new(ctx)).await?;
+        run_repl(Arc::new(ctx), lance_manager).await?;
     }
 
     Ok(())
@@ -514,7 +556,7 @@ async fn get_column_names(ctx: &SessionContext) -> HashSet<String> {
     columns
 }
 
-async fn run_repl(ctx: Arc<SessionContext>) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_repl(ctx: Arc<SessionContext>, lance_manager: Arc<LanceManager>) -> Result<(), Box<dyn std::error::Error>> {
     print_welcome();
 
     // Configure rustyline
@@ -559,7 +601,7 @@ async fn run_repl(ctx: Arc<SessionContext>) -> Result<(), Box<dyn std::error::Er
                 // Handle dot commands
                 if buffer.is_empty() && line.starts_with('.') {
                     rl.add_history_entry(line)?;
-                    match handle_dot_command(&ctx, line, &mut rl).await {
+                    match handle_dot_command(&ctx, line, &mut rl, &lance_manager).await {
                         Ok(true) => continue,
                         Ok(false) => break,
                         Err(e) => {
@@ -624,14 +666,17 @@ fn print_welcome() {
     println!("  Ctrl-U       Clear line");
     println!("  Ctrl-D       Exit (or .quit)");
     println!();
-    println!("\x1b[1mCommands:\x1b[0m .help .tables .schema <t> .load <file> .functions .history");
+    println!("\x1b[1mCommands:\x1b[0m .help .tables .schema <t> .load <file> .index .indices .functions");
     println!();
     println!("\x1b[1mLLM Functions:\x1b[0m");
     println!("  llm(template, args...)              Per-row transform (1→1)");
     println!("  llm_unfold(template, col, delim)    Fan-out, returns array (1→N)");
     println!("  llm_fold(col, reduce[, map])        Tree-reduce aggregate (M→1)");
     println!();
-    println!("  Tip: Use {{0:9\\n}} range syntax for batching (10 rows per LLM call)");
+    println!("\x1b[1mVector Functions:\x1b[0m");
+    println!("  vector_search(index, query, limit)  Semantic search (returns JSON)");
+    println!();
+    println!("  Tip: Use .index to create vector indices, {{0:9\\n}} for batching");
     println!();
 }
 
@@ -639,6 +684,7 @@ async fn handle_dot_command(
     ctx: &SessionContext,
     cmd: &str,
     rl: &mut Editor<SqlHelper, DefaultHistory>,
+    lance_manager: &Arc<LanceManager>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let parts: Vec<&str> = cmd.split_whitespace().collect();
     let command = parts.first().map(|s| s.to_lowercase()).unwrap_or_default();
@@ -654,6 +700,8 @@ async fn handle_dot_command(
             println!("  .load <path>      Load file as table (CSV, Parquet, JSON)");
             println!("  .load name=<path> Load file with custom table name");
             println!("  .functions        List all available functions");
+            println!("  .index <n> <t> <c> Create vector index from table");
+            println!("  .indices          List vector indices");
             println!("  .history          Show command history");
             println!("  .clear            Clear the screen");
             println!();
@@ -746,6 +794,9 @@ async fn handle_dot_command(
             println!("  llm_unfold(template, col, delim)    Fan-out (1→N)");
             println!("  llm_fold(col, reduce[, map])        Aggregate (M→1)");
             println!();
+            println!("\x1b[1mVector Functions:\x1b[0m");
+            println!("  vector_search(index, query, limit)  Semantic search");
+            println!();
             println!(
                 "Run 'SHOW FUNCTIONS;' to see all {} available functions.",
                 {
@@ -774,6 +825,50 @@ async fn handle_dot_command(
         }
         ".clear" | ".cls" => {
             print!("\x1b[2J\x1b[1;1H");
+            Ok(true)
+        }
+        ".index" | ".idx" => {
+            // .index <name> <table> <text_column> [id_column]
+            if parts.len() < 4 {
+                println!("Usage: .index <name> <table> <text_column> [id_column]");
+                println!("Creates a vector index from a table's text column.");
+                println!();
+                println!("Example: .index docs_idx documents content id");
+            } else {
+                let index_name = parts[1];
+                let table_name = parts[2];
+                let text_column = parts[3];
+                let id_column = parts.get(4).copied();
+
+                // Query the table
+                let df = ctx.sql(&format!("SELECT * FROM {}", table_name)).await?;
+                let batches = df.collect().await?;
+
+                if batches.is_empty() {
+                    println!("Table '{}' is empty.", table_name);
+                } else {
+                    let count = lance_manager
+                        .create_index(index_name, batches, text_column, id_column)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    println!(
+                        "Created vector index '{}' with {} embeddings.",
+                        index_name, count
+                    );
+                }
+            }
+            Ok(true)
+        }
+        ".indices" | ".vectors" => {
+            let indices = lance_manager.list_indices().await.map_err(|e| e.to_string())?;
+            if indices.is_empty() {
+                println!("No vector indices. Use .index to create one.");
+            } else {
+                println!("\x1b[1mVector Indices:\x1b[0m");
+                for idx in indices {
+                    println!("  {}", idx);
+                }
+            }
             Ok(true)
         }
         _ => {
