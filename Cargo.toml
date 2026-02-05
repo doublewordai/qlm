@@ -28,7 +28,7 @@ arrow = "53"
 uuid = { version = "1", features = ["v4"] }
 thiserror = "2"
 clap = { version = "4", features = ["derive", "env"] }
-rustyline = { version = "15", features = ["derive"] }
+rustyline = { version = "17", features = ["derive"] }
 dirs = "6"
 indicatif = "0.17"
 console = "0.15"
