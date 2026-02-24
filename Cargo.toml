@@ -24,7 +24,7 @@ reqwest = { version = "0.12", features = ["json", "multipart", "stream"] }
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-arrow = "53"
+arrow = "58"
 uuid = { version = "1", features = ["v4"] }
 thiserror = "2"
 clap = { version = "4", features = ["derive", "env"] }
