@@ -15,7 +15,7 @@ use rustyline::{CompletionType, Config, Context, EditMode, Editor, Helper};
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 #[derive(Parser, Debug)]
@@ -31,7 +31,8 @@ struct Args {
     #[arg(short = 'c', long)]
     command: Option<String>,
 
-    /// Data files to load as tables (CSV, Parquet, JSON)
+    /// Data files or directories to load as tables (CSV, Parquet, JSON).
+    /// A directory is loaded as a single table spanning all matching files.
     /// Use name=path syntax to specify table name, or just path to use filename
     #[arg(short = 't', long = "table", value_name = "NAME=PATH")]
     tables: Vec<String>,
@@ -480,22 +481,28 @@ async fn load_table(ctx: &SessionContext, spec: &str) -> Result<(), Box<dyn std:
     };
 
     let path_str = path.to_string_lossy();
-    let extension = path
-        .extension()
-        .and_then(|s| s.to_str())
-        .unwrap_or("")
-        .to_lowercase();
+    let is_dir = path.is_dir();
+    let extension = if is_dir {
+        detect_directory_format(&path)?
+    } else {
+        path.extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_lowercase()
+    };
+
+    let kind = if is_dir { "directory" } else { "file" };
 
     match extension.as_str() {
         "csv" => {
             ctx.register_csv(&name, &path_str, Default::default())
                 .await?;
-            eprintln!("Loaded CSV '{}' as table '{}'", path_str, name);
+            eprintln!("Loaded CSV {} '{}' as table '{}'", kind, path_str, name);
         }
         "parquet" => {
             ctx.register_parquet(&name, &path_str, Default::default())
                 .await?;
-            eprintln!("Loaded Parquet '{}' as table '{}'", path_str, name);
+            eprintln!("Loaded Parquet {} '{}' as table '{}'", kind, path_str, name);
         }
         ext @ ("json" | "jsonl" | "ndjson") => {
             let file_ext = format!(".{}", ext);
@@ -503,7 +510,7 @@ async fn load_table(ctx: &SessionContext, spec: &str) -> Result<(), Box<dyn std:
             options.schema_infer_max_records = 1000;
             options.file_extension = file_ext.leak();
             ctx.register_json(&name, &path_str, options).await?;
-            eprintln!("Loaded JSON '{}' as table '{}'", path_str, name);
+            eprintln!("Loaded JSON {} '{}' as table '{}'", kind, path_str, name);
         }
         _ => {
             return Err(format!("Unsupported file format: {}", extension).into());
@@ -511,6 +518,41 @@ async fn load_table(ctx: &SessionContext, spec: &str) -> Result<(), Box<dyn std:
     }
 
     Ok(())
+}
+
+fn detect_directory_format(path: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    let mut formats: HashSet<String> = HashSet::new();
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        let p = entry.path();
+        if !p.is_file() {
+            continue;
+        }
+        if let Some(ext) = p.extension().and_then(|s| s.to_str()) {
+            let ext = ext.to_lowercase();
+            if matches!(ext.as_str(), "csv" | "parquet" | "json" | "jsonl" | "ndjson") {
+                formats.insert(ext);
+            }
+        }
+    }
+    match formats.len() {
+        0 => Err(format!(
+            "No supported data files (csv/parquet/json) found in directory: {}",
+            path.display()
+        )
+        .into()),
+        1 => Ok(formats.into_iter().next().unwrap()),
+        _ => {
+            let mut sorted: Vec<_> = formats.into_iter().collect();
+            sorted.sort();
+            Err(format!(
+                "Mixed file formats in directory {}: {}. Load each format as a separate table.",
+                path.display(),
+                sorted.join(", ")
+            )
+            .into())
+        }
+    }
 }
 
 async fn execute_sql(ctx: &SessionContext, sql: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -708,8 +750,8 @@ async fn handle_dot_command(
             println!("  .quit / .exit     Exit the shell");
             println!("  .tables           List all loaded tables");
             println!("  .schema <table>   Show table schema (columns and types)");
-            println!("  .load <path>      Load file as table (CSV, Parquet, JSON)");
-            println!("  .load name=<path> Load file with custom table name");
+            println!("  .load <path>      Load file or directory as table (CSV, Parquet, JSON)");
+            println!("  .load name=<path> Load file or directory with custom table name");
             println!("  .functions        List all available functions");
             println!("  .index <t> <c> <id> Create vector index from table");
             println!("  .indices          List vector indices");
