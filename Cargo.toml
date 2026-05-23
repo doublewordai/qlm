@@ -30,7 +30,7 @@ thiserror = "2"
 clap = { version = "4", features = ["derive", "env"] }
 rustyline = { version = "15", features = ["derive"] }
 dirs = "6"
-indicatif = "0.17"
+indicatif = "0.18"
 console = "0.15"
 async-trait = "0.1.89"
 lancedb = "0.15"
